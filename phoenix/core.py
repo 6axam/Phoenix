@@ -53,7 +53,7 @@ class SnapshotManager:
         fd = os.open(self.path, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
         os.close(fd)
         os.chmod(self.path, 0o600)
-        with self.connect() as db:
+        with lock(self.path.with_suffix('.migration.lock')), self.connect() as db:
             version = db.execute("PRAGMA user_version").fetchone()[0]
             if version > DB_SCHEMA:
                 raise ValueError(f"Unsupported database schema {version}")
