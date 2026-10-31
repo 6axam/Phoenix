@@ -1,0 +1,132 @@
+from __future__ import annotations
+import argparse
+import json
+import logging
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from .capture import capture_previews
+from .core import Collector, DesktopRegistry, HyprlandBackend, SnapshotManager, config, lock, trust_desktop, xdg
+from .recovery import RecoveryExecutor
+from .session import decided, decide
+from .watch import watch_workspace_events
+
+
+def parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog='phoenix', description='Безопасные снимки сессии Hyprland')
+    sub = p.add_subparsers(dest='command', required=True)
+    sub.add_parser('status', help='Состояние базы и фонового процесса')
+    snap = sub.add_parser('snapshot', help='Создать ручной снимок'); snap.add_argument('--name')
+    sub.add_parser('history', help='История снимков')
+    inspect = sub.add_parser('inspect', help='Проверить и показать снимок'); inspect.add_argument('snapshot', nargs='?', default='latest')
+    restore = sub.add_parser('restore', help='Восстановить или показать план'); restore.add_argument('snapshot', nargs='?', default='latest'); restore.add_argument('--safe', action='store_true', help='Только безопасные действия (режим по умолчанию)'); restore.add_argument('--dry-run', action='store_true')
+    sub.add_parser('doctor', help='Диагностика окружения')
+    gui = sub.add_parser('gui', help='Открыть интерфейс'); gui.add_argument('--prompt', action='store_true', help=argparse.SUPPRESS)
+    sub.add_parser('daemon', help='Запустить периодические снимки и запрос при входе')
+    sub.add_parser('config', help='Показать настройки и путь')
+    sub.add_parser('backup', help='Создать проверенную резервную копию')
+    trust = sub.add_parser('trust-desktop', help='Доверять конкретному desktop-файлу до его изменения'); trust.add_argument('path', help='Абсолютный путь к desktop-файлу')
+    return p
+
+
+def dump(value: object) -> None:
+    print(json.dumps(value, ensure_ascii=False, indent=2))
+
+
+def daemon(manager: SnapshotManager, backend: HyprlandBackend) -> int:
+    stop = threading.Event()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda *_: stop.set())
+    with lock(xdg('STATE') / 'daemon.lock', blocking=False):
+        has_snapshot = bool(manager.history())
+        if has_snapshot and not decided():
+            try:
+                # GUI owns the decision; closing or crashing leaves the collector paused.
+                proc = subprocess.Popen([sys.executable, '-m', 'phoenix', 'gui', '--prompt'])
+                while proc.poll() is None and not stop.wait(0.5):
+                    pass
+                if stop.is_set() and proc.poll() is None:
+                    proc.terminate()
+                    try: proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired: proc.kill(); proc.wait()
+            except OSError as exc:
+                logging.error('GUI unavailable: %s', exc)
+        elif not has_snapshot and not decided():
+            decide('skip')
+        def capture_workspace() -> None:
+            if decided():
+                manager.record_workspace_captures(capture_previews(backend, config()))
+        watcher = threading.Thread(target=watch_workspace_events, args=(stop, capture_workspace), name='phoenix-workspaces', daemon=True)
+        watcher.start()
+        while not stop.is_set():
+            try:
+                if decided():
+                    state = Collector(backend).collect()
+                    if state['windows']:
+                        manager.save(state, automatic=True, previews=capture_previews(backend, config()))
+                    manager.backup_if_due()
+                else:
+                    logging.warning('Snapshots paused until a session decision is made')
+            except Exception:
+                logging.exception('Snapshot failed')
+            interval = max(10, int(config().get('interval_seconds', 60)))
+            stop.wait(interval)
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s %(message)s')
+    args = parser().parse_args(argv)
+    try:
+        manager = SnapshotManager(); backend = HyprlandBackend()
+        if args.command == 'snapshot':
+            state = Collector(backend).collect()
+            if not state['windows']: raise RuntimeError('Refusing to save an empty snapshot')
+            print(manager.save(state, name=args.name, previews=capture_previews(backend, config())))
+        elif args.command == 'history': dump(manager.history())
+        elif args.command == 'inspect':
+            row, state = manager.get(args.snapshot); dump({'id': row['id'], 'state': state})
+        elif args.command == 'restore':
+            row, state = manager.get(args.snapshot)
+            result = RecoveryExecutor(backend, DesktopRegistry(), manager).restore(row['id'], state, args.dry_run)
+            dump(result)
+            if not args.dry_run:
+                decide('restore')
+                if any(x['status'] in ('error', 'timeout', 'unsupported', 'uncertain') for x in result): return 2
+        elif args.command == 'status':
+            running = True
+            try:
+                with lock(xdg('STATE') / 'daemon.lock', blocking=False): running = False
+            except BlockingIOError: pass
+            dump({'daemon_running': running, 'database': str(manager.path), 'integrity': manager.integrity(), 'snapshots': len(manager.history()), 'session_decided': decided() if os.environ.get('HYPRLAND_INSTANCE_SIGNATURE') else None})
+        elif args.command == 'doctor':
+            checks = {x: shutil.which(x) for x in ('hyprctl', 'kitty', 'tmux', 'gio', 'nautilus')}
+            try: checks['hyprland_clients'] = len(backend.query('clients'))
+            except Exception as e: checks['hyprland_error'] = str(e)
+            try:
+                import gi
+                gi.require_version('Gtk', '4.0')
+                from gi.repository import Gtk  # noqa: F401
+                checks['gtk4'] = True
+            except (ImportError, ValueError): checks['gtk4'] = False
+            checks['integrity'] = manager.integrity(); dump(checks)
+        elif args.command == 'trust-desktop':
+            from pathlib import Path
+            trust_desktop(Path(args.path))
+            print('Desktop entry trusted:', args.path)
+        elif args.command == 'backup': print(manager.backup())
+        elif args.command == 'config': dump({'path': str(xdg('CONFIG') / 'config.json'), 'settings': config()})
+        elif args.command == 'daemon': return daemon(manager, backend)
+        elif args.command == 'gui':
+            from .gui import run
+            return run(manager, backend, args.prompt)
+        return 0
+    except (OSError, RuntimeError, LookupError, ValueError, ImportError, BlockingIOError) as exc:
+        print(f'phoenix: {exc}', file=sys.stderr); return 1
+
+if __name__ == '__main__':
+    raise SystemExit(main())

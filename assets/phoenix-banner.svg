@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="380" viewBox="0 0 1200 380">
+<defs><linearGradient id="bg" x2="1" y2="1"><stop stop-color="#0c151b"/><stop offset="1" stop-color="#152e30"/></linearGradient><linearGradient id="fire" x2="0" y2="1"><stop stop-color="#f9cf91"/><stop offset="1" stop-color="#ed7456"/></linearGradient></defs>
+<rect width="1200" height="380" rx="24" fill="url(#bg)"/>
+<path d="M850 335 945 206 1010 274 1081 174 1200 310v70H850z" fill="#284644" opacity=".5"/><path d="M780 380 932 250l74 60 103-99 91 88" fill="none" stroke="#76b6a2" stroke-opacity=".22" stroke-width="2"/>
+<circle cx="1000" cy="145" r="94" fill="#f6af75" opacity=".06"/>
+<path d="M1000 54c26 42 14 57 4 69 28-6 35-24 36-37 38 46 19 107-40 137-59-30-78-91-40-137 1 13 8 31 36 37-10-12-22-27 4-69z" fill="url(#fire)"/>
+<path d="M1000 144c20 17 19 36 0 51-19-15-20-34 0-51z" fill="#193331"/>
+<text x="70" y="152" fill="#f4f3e9" font-family="system-ui,sans-serif" font-size="80" font-weight="700" letter-spacing="8">PHOENIX</text>
+<text x="74" y="205" fill="#a7d0c1" font-family="system-ui,sans-serif" font-size="24" letter-spacing="2">YOUR DESKTOP, REMEMBERED.</text>
+<text x="74" y="271" fill="#a8b8b2" font-family="system-ui,sans-serif" font-size="20">Session snapshots &amp; recovery for Hyprland</text>
+</svg>

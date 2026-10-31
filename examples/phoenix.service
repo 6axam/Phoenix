@@ -1,0 +1,13 @@
+# Пример: вручную заменить путь на абсолютный; Phoenix не устанавливает и не включает unit.
+[Unit]
+Description=Phoenix session snapshot daemon
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=/ABSOLUTE/PATH/TO/Foenix/phoenix.sh daemon
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=graphical-session.target
