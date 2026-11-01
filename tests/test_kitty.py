@@ -251,3 +251,14 @@ def test_scrollback_batch_memory_is_bounded(kitty_socket, monkeypatch):
     result, archives=KittyAdapter({'kitty_enabled':True,'kitty_socket':str(kitty_socket)},runner).collect(True)
     assert sum(len(a['data']) for a in archives) <= 1500
     assert any('memory budget' in warning for warning in result.warnings)
+
+
+def test_recovery_plan_reflects_selected_panes_and_open_window(tmp_path):
+    from test_phoenix import FakeBackend, FakeRegistry, state, window
+    data={'version':1,'active_tab':0,'tabs':[{'layout':'tall','active_pane':0,'panes':[{'cwd':None,'process':'unknown'},{'cwd':None,'process':'other'}]}]}
+    snap=state(window(adapters={'kitty':data})); m=SnapshotManager(tmp_path/'db'); sid=m.save(snap)
+    backend=FakeBackend([{'address':'0xaa','class':'kitty'}]); executor=RecoveryExecutor(backend,FakeRegistry(),m)
+    plan=executor.restore(sid,snap,dry_run=True,selected={0},components={0:{(0,0)}})
+    statuses={step['id']:step['status'] for step in plan[0]['steps']}
+    assert statuses['pane:0:0']=='unverified' and statuses['pane:0:1']=='skipped'
+    assert executor.restore(sid,snap,dry_run=True,selected=set())[0]['action']=='skip'

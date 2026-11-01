@@ -90,8 +90,10 @@ def run(manager: SnapshotManager, backend: HyprlandBackend, prompt: bool = False
         def show_preview(_button: Any) -> None:
             try: row, state = current()
             except Exception as exc: output.set_text(str(exc)); return
+            selected = {i for i, cb in enumerate(checkboxes) if cb.get_active()}
+            components = {i: {key for key, cb in panes.items() if cb.get_active()} for i, panes in pane_checks.items()}
             def work() -> str:
-                plan = RecoveryPlanner(DesktopRegistry(), manager).plan(state, backend.query('clients'), row['id'])
+                plan = RecoveryPlanner(DesktopRegistry(), manager).plan(state, backend.query('clients'), row['id'], selected, components)
                 lines = []
                 for p in plan:
                     lines.append(f"{p['class']}: {p['action']}")

@@ -36,7 +36,7 @@ class RecoveryPlanner:
         self.registry = registry
         self.manager = manager
 
-    def plan(self, state: dict[str, Any], clients: list[dict[str, Any]], snapshot_id: int | None = None) -> list[dict[str, Any]]:
+    def plan(self, state: dict[str, Any], clients: list[dict[str, Any]], snapshot_id: int | None = None, selected: set[int] | None = None, components: dict[int, set[tuple[int, int]]] | None = None) -> list[dict[str, Any]]:
         available = list(clients)
         plan = []
         adapters = builtin_adapters({})
@@ -68,9 +68,27 @@ class RecoveryPlanner:
             if item['action'] == 'existing':
                 for step in item['steps']:
                     if step['id'] in ('kitty', 'window'): step['status'] = 'already_open'
+                    elif step['id'].startswith(('tab:', 'pane:')):
+                        step['status'] = 'unverified'
+                        step['detail'] = 'Existing Kitty tabs and panes will not be modified'
             elif item['action'] == 'unsupported':
                 for step in item['steps']:
                     if step['id'] != 'workspace' and not step['id'].startswith('archive:'): step['status'] = 'unavailable'
+            if selected is not None and item['index'] not in selected:
+                item['action'] = 'skip'
+                for step in item['steps']: step['status'] = 'skipped'
+            elif components is not None and item['index'] in components:
+                chosen = components[item['index']]
+                for step in item['steps']:
+                    bits = step['id'].split(':')
+                    if len(bits) == 3 and bits[0] in ('pane', 'process') and (int(bits[1]), int(bits[2])) not in chosen:
+                        step['status'] = 'skipped'
+                    elif len(bits) == 2 and bits[0] == 'tab' and not any(tab == int(bits[1]) for tab, _ in chosen):
+                        step['status'] = 'skipped'
+                if not chosen:
+                    item['action'] = 'skip'
+                    for step in item['steps']:
+                        if not step['id'].startswith('archive:'): step['status'] = 'skipped'
         return plan
 
 
@@ -80,7 +98,7 @@ class RecoveryExecutor:
 
     def restore(self, snapshot_id: int, state: dict[str, Any], dry_run: bool = False, selected: set[int] | None = None, components: dict[int, set[tuple[int, int]]] | None = None) -> list[dict[str, Any]]:
         if dry_run:
-            return RecoveryPlanner(self.registry, self.manager).plan(state, self.backend.query('clients'), snapshot_id)
+            return RecoveryPlanner(self.registry, self.manager).plan(state, self.backend.query('clients'), snapshot_id, selected, components)
         # A single restore process can mutate windows at a time; process death releases the lock.
         with lock(self.manager.path.with_suffix('.restore.lock'), blocking=False):
             return self._restore(snapshot_id, state, selected, components)
