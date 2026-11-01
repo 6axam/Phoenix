@@ -25,13 +25,29 @@ SCHEMA = 1
 DB_SCHEMA = 5
 
 
-def xdg(kind: str) -> Path:
+def xdg_path(kind: str) -> Path:
     defaults = {"DATA": ".local/share", "CONFIG": ".config", "STATE": ".local/state"}
-    base = Path(os.environ.get("XDG_" + kind + "_HOME", Path.home() / defaults[kind]))
-    path = base / "phoenix"
+    return Path(os.environ.get("XDG_" + kind + "_HOME", Path.home() / defaults[kind])) / "phoenix"
+
+
+def xdg(kind: str) -> Path:
+    path = xdg_path(kind)
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(path, 0o700)
     return path
+
+
+def is_locked(path: Path) -> bool:
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return False
+    try:
+        try: fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError: return True
+        return False
+    finally:
+        os.close(fd)
 
 
 def canonical(value: Any) -> str:
@@ -78,16 +94,20 @@ def running_daemons_for(database: Path) -> list[int]:
 
 
 class SnapshotManager:
-    def __init__(self, path: Path | None = None, *, legacy_readonly: bool = False):
-        self.path = path or xdg("DATA") / "snapshots.sqlite3"
+    def __init__(self, path: Path | None = None, *, legacy_readonly: bool = False, readonly: bool = False):
+        self.path = path or (xdg_path("DATA") if readonly or legacy_readonly else xdg("DATA")) / "snapshots.sqlite3"
         self.readonly = False
         new_database = not self.path.exists() or self.path.stat().st_size == 0
-        # Diagnostics can inspect a v4 database without upgrading it or touching WAL.
-        if legacy_readonly and self.path.exists():
+        self.db_version = DB_SCHEMA
+        if readonly or legacy_readonly:
+            if not self.path.exists():
+                raise LookupError('Snapshot database does not exist')
             with contextlib.closing(sqlite3.connect(self.path.resolve().as_uri() + '?mode=ro', uri=True, timeout=15)) as probe:
-                if probe.execute('PRAGMA user_version').fetchone()[0] == 4:
-                    self.readonly = True
-                    return
+                self.db_version = probe.execute('PRAGMA user_version').fetchone()[0]
+            if self.db_version not in (4, DB_SCHEMA):
+                raise ValueError(f'Read-only access does not support database schema {self.db_version}')
+            self.readonly = True
+            return
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         fd = os.open(self.path, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
         os.close(fd)
@@ -284,7 +304,7 @@ class SnapshotManager:
                     state = json.loads(row['payload'])
                     if not isinstance(state, dict) or not isinstance(state.get('windows'), list):
                         continue
-                    if not self.readonly:
+                    if self.db_version >= 5:
                         self._reconcile_archive_statuses(db, row['id'], state)
                     return dict(row), state
                 except (ValueError, TypeError):
@@ -358,6 +378,7 @@ class SnapshotManager:
                 db.execute('INSERT INTO recovery_steps VALUES(?,?,?,?,?,?) ON CONFLICT(transaction_id,window_index,step_id) DO UPDATE SET status=excluded.status,updated=excluded.updated', (transaction, snapshot_id, window, step, status, time.time()))
 
     def recovery_log(self, snapshot_id: int) -> list[dict[str, Any]]:
+        if self.db_version < 5: return []
         with self.connect() as db:
             return [dict(row) for row in db.execute('SELECT transaction_id,window_index,step_id,status,updated FROM recovery_steps WHERE snapshot_id=? ORDER BY updated,window_index,step_id', (snapshot_id,))]
 
@@ -366,10 +387,12 @@ class SnapshotManager:
             db.execute("INSERT INTO runs VALUES(?,?,?,?,?) ON CONFLICT(snapshot_id) DO UPDATE SET transaction_id=excluded.transaction_id,state=excluded.state,updated=excluded.updated,result=excluded.result", (snapshot_id, transaction, state, time.time(), canonical(result)))
 
     def archives(self, snapshot_id: int) -> list[dict[str, Any]]:
+        if self.db_version < 5: return []
         with self.connect() as db:
             return [dict(r) for r in db.execute('SELECT r.window_index,r.tab_index,r.pane_index,SUM(c.raw_size) AS bytes,COUNT(*) AS chunks FROM archive_refs r JOIN archive_chunks c ON c.digest=r.digest WHERE r.snapshot_id=? GROUP BY r.window_index,r.tab_index,r.pane_index ORDER BY r.window_index,r.tab_index,r.pane_index', (snapshot_id,))]
 
     def archive_text(self, snapshot_id: int, window: int, tab: int, pane: int, limit: int = 128 * 1024**2) -> bytes:
+        if self.db_version < 5: raise LookupError('Terminal archive not found')
         with self.connect() as db:
             manifest = db.execute('SELECT parts,raw_size,digest FROM archive_manifests WHERE snapshot_id=? AND window_index=? AND tab_index=? AND pane_index=?', (snapshot_id, window, tab, pane)).fetchone()
             rows = db.execute('SELECT r.part,c.digest,c.raw_size,length(c.data) AS stored_size FROM archive_refs r JOIN archive_chunks c ON c.digest=r.digest WHERE r.snapshot_id=? AND r.window_index=? AND r.tab_index=? AND r.pane_index=? ORDER BY r.part', (snapshot_id, window, tab, pane)).fetchall()
@@ -455,7 +478,7 @@ class SnapshotManager:
 
 
 def config() -> dict[str, Any]:
-    path = xdg('CONFIG') / 'config.json'
+    path = xdg_path('CONFIG') / 'config.json'
     if not path.exists():
         return {'exclude_classes': [], 'interval_seconds': 60}
     data = json.loads(path.read_text())

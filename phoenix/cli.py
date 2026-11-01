@@ -12,7 +12,7 @@ import threading
 import time
 from .adapters import builtin_adapters
 from .capture import capture_previews
-from .core import Collector, DesktopRegistry, HyprlandBackend, SnapshotManager, config, lock, trust_desktop, xdg
+from .core import Collector, DesktopRegistry, HyprlandBackend, SnapshotManager, config, is_locked, lock, trust_desktop, xdg, xdg_path
 from .recovery import RecoveryExecutor
 from .session import decided, decide
 from .watch import watch_workspace_events
@@ -92,7 +92,17 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s %(message)s')
     args = parser().parse_args(argv)
     try:
-        manager = SnapshotManager(legacy_readonly=args.command in ('status', 'history', 'inspect', 'doctor')); backend = HyprlandBackend()
+        if args.command == 'config':
+            dump({'path': str(xdg_path('CONFIG') / 'config.json'), 'settings': config()}); return 0
+        readonly = args.command in ('status', 'history', 'inspect', 'doctor', 'recovery-log') or (args.command == 'restore' and args.dry_run) or (args.command == 'archive' and args.archive_command in ('list', 'show'))
+        database = xdg_path('DATA') / 'snapshots.sqlite3'
+        missing_readonly = readonly and not database.exists()
+        if missing_readonly and args.command == 'history':
+            dump([]); return 0
+        if missing_readonly and args.command == 'status':
+            dump({'daemon_running': is_locked(xdg_path('STATE') / 'daemon.lock'), 'database': str(database), 'integrity': 'not_created', 'snapshots': 0, 'session_decided': decided() if os.environ.get('HYPRLAND_INSTANCE_SIGNATURE') else None}); return 0
+        manager = None if missing_readonly and args.command == 'doctor' else SnapshotManager(readonly=readonly)
+        backend = HyprlandBackend()
         if args.command == 'snapshot':
             collector = Collector(backend); state = collector.collect()
             if not state['windows']: raise RuntimeError('Refusing to save an empty snapshot')
@@ -109,10 +119,7 @@ def main(argv: list[str] | None = None) -> int:
                 decide('restore')
                 if any(x['status'] in ('error', 'timeout', 'unsupported', 'uncertain') for x in result): return 2
         elif args.command == 'status':
-            running = True
-            try:
-                with lock(xdg('STATE') / 'daemon.lock', blocking=False): running = False
-            except BlockingIOError: pass
+            running = is_locked(xdg_path('STATE') / 'daemon.lock')
             dump({'daemon_running': running, 'database': str(manager.path), 'integrity': manager.integrity(), 'snapshots': len(manager.history()), 'session_decided': decided() if os.environ.get('HYPRLAND_INSTANCE_SIGNATURE') else None})
         elif args.command == 'doctor':
             checks = {x: shutil.which(x) for x in ('hyprctl', 'kitty', 'tmux', 'gio', 'nautilus')}
@@ -124,7 +131,7 @@ def main(argv: list[str] | None = None) -> int:
                 from gi.repository import Gtk  # noqa: F401
                 checks['gtk4'] = True
             except (ImportError, ValueError): checks['gtk4'] = False
-            checks['integrity'] = manager.integrity(); checks['adapters'] = builtin_adapters(config()).diagnostics(); dump(checks)
+            checks['integrity'] = manager.integrity() if manager else 'not_created'; checks['adapters'] = builtin_adapters(config()).diagnostics(); dump(checks)
         elif args.command == 'trust-desktop':
             from pathlib import Path
             trust_desktop(Path(args.path))
@@ -141,7 +148,6 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     from .text import safe_text
                     print(safe_text(manager.archive_text(row['id'], args.window, args.tab, args.pane)), end='')
-        elif args.command == 'config': dump({'path': str(xdg('CONFIG') / 'config.json'), 'settings': config()})
         elif args.command == 'daemon': return daemon(manager, backend)
         elif args.command == 'gui':
             from .gui import run

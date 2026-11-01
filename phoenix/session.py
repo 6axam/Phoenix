@@ -2,18 +2,18 @@ from __future__ import annotations
 import hashlib
 import os
 from pathlib import Path
-from .core import xdg
+from .core import xdg, xdg_path
 
 
-def marker() -> Path:
+def marker(*, create: bool = True) -> Path:
     signature = os.environ.get('HYPRLAND_INSTANCE_SIGNATURE')
     if not signature:
         raise RuntimeError('Not in a Hyprland session')
-    return xdg('STATE') / ('decision-' + hashlib.sha256(signature.encode()).hexdigest()[:24])
+    return (xdg('STATE') if create else xdg_path('STATE')) / ('decision-' + hashlib.sha256(signature.encode()).hexdigest()[:24])
 
 
 def decided() -> bool:
-    return marker().exists()
+    return marker(create=False).exists()
 
 
 def decide(value: str) -> None:
