@@ -115,3 +115,14 @@ def test_query_failure_after_launch_is_uncertain_and_not_retried(tmp_path):
     assert first[0]['status']=='uncertain' and reg.launches==1
     second=RecoveryExecutor(b,reg,m,.01).restore(sid,snapshot)
     assert second[0]['status']=='uncertain' and reg.launches==1
+
+
+def test_adapter_diagnostics_checks_additional_sockets(tmp_path,monkeypatch):
+    import socket
+    import phoenix.adapters.kitty as module
+    directory=tmp_path/'private'; directory.mkdir(mode=0o700); path=directory/'kitty.sock'
+    with socket.socket(socket.AF_UNIX) as sock:
+        sock.bind(str(path))
+        monkeypatch.setattr(module.shutil,'which',lambda name:'/bin/true')
+        result=KittyAdapter({'kitty_enabled':True,'kitty_socket':'/missing','kitty_sockets':[str(path)]}).availability()
+        assert result.status.value=='partial' and '1/2' in result.warnings[0]

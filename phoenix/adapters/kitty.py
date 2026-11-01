@@ -116,11 +116,20 @@ class KittyAdapter:
             return AdapterResult(Status.SKIPPED, warnings=['Detailed Kitty collection is disabled'])
         if not shutil.which('kitten') or not shutil.which('kitty'):
             return AdapterResult(Status.UNSUPPORTED, warnings=['kitty or kitten is missing'])
-        try:
-            self.socket()
-            return AdapterResult(Status.PARTIAL, warnings=['Socket exists; authorization is checked on collection'])
-        except KittyError as exc:
-            return AdapterResult(Status.UNSUPPORTED, warnings=[str(exc)])
+        primary = self.settings.get('kitty_socket') or os.environ.get('PHOENIX_KITTY_SOCKET', '')
+        extras = self.settings.get('kitty_sockets', [])
+        paths = list(dict.fromkeys(p for p in [primary, *(extras if isinstance(extras, list) else [])] if isinstance(p, str) and p))[:16]
+        if not paths:
+            return AdapterResult(Status.UNSUPPORTED, warnings=['Set a private Kitty socket in Phoenix settings'])
+        available = 0
+        for path in paths:
+            try:
+                secure_socket(path); available += 1
+            except KittyError:
+                continue
+        if not available:
+            return AdapterResult(Status.UNSUPPORTED, warnings=['No configured Kitty socket is available or private'])
+        return AdapterResult(Status.PARTIAL, warnings=[f'{available}/{len(paths)} Kitty sockets available; authorization is checked on collection'])
 
     def request(self, command: list[str], limit: int, timeout: float = 5) -> bytes:
         try:

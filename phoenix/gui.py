@@ -67,7 +67,9 @@ def run(manager: SnapshotManager, backend: HyprlandBackend, prompt: bool = False
                         pane_checks[wi] = {}
                         for ti, tab in enumerate(data['tabs']):
                             for pi, pane in enumerate(tab['panes']):
-                                label = f"Вкладка {ti+1}, панель {pi+1} · {pane.get('cwd') or 'каталог неизвестен'}"
+                                status_names = {'saved':'архив сохранён', 'truncated':'архив усечён', 'excluded':'архив исключён', 'quota_exceeded':'квота архива исчерпана', 'failed':'ошибка архива', 'not_saved':'архив отсутствует', 'disabled':'архив выключен', 'unavailable':'архив недоступен'}
+                                archive_status = status_names.get(pane.get('scrollback_capture'), 'состояние архива неизвестно')
+                                label = f"Вкладка {ti+1}, панель {pi+1} · {pane.get('cwd') or 'каталог неизвестен'} · {archive_status}"
                                 child = Gtk.CheckButton(label=label); child.set_margin_start(26); child.set_active(True)
                                 checks.append(child); pane_checks[wi][(ti,pi)] = child
                 details.set_label(f'Приложения в снимке: {len(checkboxes)}')
@@ -191,6 +193,10 @@ def run(manager: SnapshotManager, backend: HyprlandBackend, prompt: bool = False
             box.append(Gtk.Label(label=f"База и WAL: {manager.storage_bytes()/1024/1024:.1f} МБ. Изображения могут содержать личные данные.", xalign=0, wrap=True))
             kitty_enabled = Gtk.CheckButton(label='Собирать подробную структуру Kitty'); kitty_enabled.set_active(bool(cfg.get('kitty_enabled', False))); box.append(kitty_enabled)
             kitty_socket = Gtk.Entry(); kitty_socket.set_placeholder_text('Абсолютный путь к приватному Unix-сокету Kitty'); kitty_socket.set_text(str(cfg.get('kitty_socket', ''))); box.append(kitty_socket)
+            box.append(Gtk.Label(label='Дополнительные сокеты Kitty — по одному пути в строке', xalign=0, wrap=True))
+            sockets_view = Gtk.TextView(monospace=True, wrap_mode=Gtk.WrapMode.NONE); sockets_view.set_size_request(-1, 64)
+            sockets_view.get_buffer().set_text('\n'.join(str(x) for x in cfg.get('kitty_sockets', []) if isinstance(x, str)))
+            sockets_scroll = Gtk.ScrolledWindow(); sockets_scroll.set_min_content_height(64); sockets_scroll.set_max_content_height(100); sockets_scroll.set_child(sockets_view); box.append(sockets_scroll)
             scrollback = Gtk.CheckButton(label='Архивировать текст терминала (может содержать пароли и токены)'); scrollback.set_active(bool(cfg.get('kitty_scrollback', False))); box.append(scrollback)
             box.append(Gtk.Label(label='Лимит на панель, МиБ', xalign=0))
             pane_limit = Gtk.SpinButton.new_with_range(1, 128, 1); pane_limit.set_value(int(cfg.get('kitty_scrollback_limit', 32*1024**2))/1024**2); box.append(pane_limit)
@@ -216,7 +222,7 @@ def run(manager: SnapshotManager, backend: HyprlandBackend, prompt: bool = False
             def response(box_dialog: Any, answer: int) -> None:
                 if answer == Gtk.ResponseType.ACCEPT:
                     try:
-                        update_config({'capture_previews': capture.get_active(), 'snapshot_retention': retention.get_value_as_int(), 'interval_seconds': interval.get_value_as_int(), 'kitty_enabled': kitty_enabled.get_active(), 'kitty_scrollback': scrollback.get_active(), 'kitty_socket': kitty_socket.get_text(), 'kitty_scrollback_limit': pane_limit.get_value_as_int() * 1024**2, 'kitty_archive_total_limit': total_limit.get_value_as_int() * 1024**2})
+                        update_config({'capture_previews': capture.get_active(), 'snapshot_retention': retention.get_value_as_int(), 'interval_seconds': interval.get_value_as_int(), 'kitty_enabled': kitty_enabled.get_active(), 'kitty_scrollback': scrollback.get_active(), 'kitty_socket': kitty_socket.get_text(), 'kitty_sockets': [x.strip() for x in sockets_view.get_buffer().get_text(sockets_view.get_buffer().get_start_iter(), sockets_view.get_buffer().get_end_iter(), True).splitlines() if x.strip()], 'kitty_scrollback_limit': pane_limit.get_value_as_int() * 1024**2, 'kitty_archive_total_limit': total_limit.get_value_as_int() * 1024**2})
                         output.set_text('Настройки сохранены. Ранее сохранённые изображения остаются в истории и резервных копиях.')
                     except Exception as exc: output.set_text('Ошибка: ' + str(exc))
                 box_dialog.destroy()
