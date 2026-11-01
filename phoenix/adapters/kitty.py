@@ -92,10 +92,24 @@ class KittyAdapter:
         return str(window.get('class', '')).casefold() == 'kitty'
 
     def socket(self) -> str:
-        path = self.settings.get('kitty_socket') or os.environ.get('PHOENIX_KITTY_SOCKET', '')
+        paths = self.settings.get('kitty_sockets', [])
+        first = next((item for item in paths if isinstance(item, str) and item), '') if isinstance(paths, list) else ''
+        path = self.settings.get('kitty_socket') or os.environ.get('PHOENIX_KITTY_SOCKET', '') or first
         if not isinstance(path, str) or not path:
             raise KittyError('Set a private Kitty socket in Phoenix settings')
         return secure_socket(path)
+
+    def peer_pid(self) -> int:
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                connection.settimeout(2)
+                connection.connect(self.socket())
+                pid, uid, _ = struct.unpack('3i', connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            if uid != os.getuid() or pid <= 0:
+                raise KittyError('Kitty socket peer does not belong to current user')
+            return pid
+        except OSError as exc:
+            raise KittyError('Kitty socket peer is unavailable') from exc
 
     def availability(self) -> AdapterResult:
         if not self.settings.get('kitty_enabled', False):
@@ -114,19 +128,16 @@ class KittyAdapter:
         except (OSError, ValueError) as exc:
             raise KittyError('Kitty remote control is unavailable') from exc
 
-    def collect(self, collect_text: bool = False, expected_pid: int | None = None) -> tuple[AdapterResult, list[dict[str, Any]]]:
+    def collect(self, collect_text: bool = False, expected_pid: int | None = None, deadline: float | None = None, memory_budget: int = MAX_CAPTURE_BATCH) -> tuple[AdapterResult, list[dict[str, Any]]]:
         if not self.settings.get('kitty_enabled', False):
             return AdapterResult(Status.SKIPPED), []
         try:
-            if expected_pid is not None:
-                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-                    connection.settimeout(2)
-                    connection.connect(self.socket())
-                    peer_pid, peer_uid, _ = struct.unpack('3i', connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
-                if peer_uid != os.getuid() or peer_pid != expected_pid:
-                    raise KittyError('Kitty socket does not belong to the matching window process')
-            deadline = time.monotonic() + 15
-            os_windows = json.loads(self.request(['ls'], MAX_JSON))
+            if expected_pid is not None and self.peer_pid() != expected_pid:
+                raise KittyError('Kitty socket does not belong to the matching window process')
+            deadline = min(deadline or time.monotonic() + 15, time.monotonic() + 15)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0: raise KittyError('Kitty collection time limit reached')
+            os_windows = json.loads(self.request(['ls'], MAX_JSON, timeout=min(5, remaining)))
             if not isinstance(os_windows, list) or len(os_windows) != 1:
                 return AdapterResult(Status.PARTIAL, warnings=['Kitty OS windows cannot be matched unambiguously']), []
             tabs = os_windows[0].get('tabs', [])
@@ -160,7 +171,7 @@ class KittyAdapter:
                         try:
                             remaining = deadline - time.monotonic()
                             if remaining <= 0: raise KittyError('Kitty collection time limit reached')
-                            batch_remaining = MAX_CAPTURE_BATCH - archive_bytes
+                            batch_remaining = min(MAX_CAPTURE_BATCH, max(0, memory_budget)) - archive_bytes
                             if batch_remaining < 1024: raise KittyError('Kitty collection memory budget reached')
                             truncated = False
                             try:
@@ -206,7 +217,7 @@ class KittyAdapter:
         if not self.validate(data): return [PlanStep('kitty', 'kitty', status='unavailable', detail='Invalid Kitty state')]
         steps = [PlanStep('workspace', 'workspace'), PlanStep('kitty', 'kitty OS window', ['workspace'])]
         for ti, tab in enumerate(data['tabs']):
-            steps.append(PlanStep(f'tab:{ti}', 'tab', ['kitty']))
+            steps.append(PlanStep(f'tab:{ti}', 'tab', ['kitty'], status='partial' if len(tab['panes']) > 1 else 'available', detail='Panel split tree and exact sizes are not documented in the session interface' if len(tab['panes']) > 1 else ''))
             for pi, _ in enumerate(tab['panes']):
                 ident = f'pane:{ti}:{pi}'
                 cwd = tab['panes'][pi].get('cwd')

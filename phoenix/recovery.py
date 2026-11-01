@@ -40,7 +40,12 @@ class RecoveryPlanner:
         available = list(clients)
         plan = []
         adapters = builtin_adapters({})
+        saved_kitty = sum(str(w.get('class','')).casefold() == 'kitty' for w in state['windows'])
+        current_kitty = sum(str(c.get('class','')).casefold() == 'kitty' for c in clients)
         for index, window in enumerate(state['windows']):
+            if str(window.get('class','')).casefold() == 'kitty' and current_kitty and (saved_kitty > 1 or current_kitty > 1):
+                plan.append({'index':index, 'class':window['class'], 'action':'uncertain'})
+                continue
             match = next((c for c in available if same_class(window, c)), None)
             if match:
                 available.remove(match)
@@ -71,7 +76,7 @@ class RecoveryPlanner:
                     elif step['id'].startswith(('tab:', 'pane:')):
                         step['status'] = 'unverified'
                         step['detail'] = 'Existing Kitty tabs and panes will not be modified'
-            elif item['action'] == 'unsupported':
+            elif item['action'] in ('unsupported', 'uncertain'):
                 for step in item['steps']:
                     if step['id'] != 'workspace' and not step['id'].startswith('archive:'): step['status'] = 'unavailable'
             if selected is not None and item['index'] not in selected:
@@ -120,12 +125,21 @@ class RecoveryExecutor:
             clients = self.backend.query('clients')
             monitors = self.backend.query('monitors')
             claimed: set[str] = set()
+            initial_addresses = {c.get('address') for c in clients}
+            saved_kitty = sum(str(w.get('class','')).casefold() == 'kitty' for w in state['windows'])
+            current_kitty = sum(str(c.get('class','')).casefold() == 'kitty' for c in clients)
+            kitty_uncertain = any(str(state['windows'][i].get('class','')).casefold() == 'kitty' for i in uncertain if isinstance(i,int) and 0 <= i < len(state['windows']))
             for index, window in enumerate(state['windows']):
                 if selected is not None and index not in selected:
                     continue
                 result: dict[str, Any] = {'index': index, 'class': window.get('class', ''), 'status': 'unsupported'}
                 results.append(result)
+                launch_started = False
+                is_kitty = str(window.get('class', '')).casefold() == 'kitty'
                 try:
+                    if is_kitty and ((current_kitty and (saved_kitty > 1 or current_kitty > 1)) or (kitty_uncertain and not (current_kitty == 1 and saved_kitty == 1))):
+                        result.update(status='uncertain', detail='Kitty window identity is ambiguous; no window was launched or modified')
+                        continue
                     selected_data = None
                     if components is not None and index in components and str(window.get('class', '')).casefold() == 'kitty':
                         adapter = builtin_adapters({}).get('kitty')
@@ -135,7 +149,7 @@ class RecoveryExecutor:
                             if selected_data is None:
                                 result.update(status='skipped', detail='No Kitty panes selected')
                                 continue
-                    match = next((c for c in clients if c.get('address') not in claimed and same_class(window, c)), None)
+                    match = next((c for c in clients if c.get('address') in initial_addresses and c.get('address') not in claimed and same_class(window, c)), None)
                     if not match:
                         if index in uncertain:
                             result.update(status='uncertain', detail='A previous launch may still open; automatic retry suppressed')
@@ -148,30 +162,47 @@ class RecoveryExecutor:
                         result['status'] = 'launching'
                         self.manager.run_state(snapshot_id, transaction, 'running', durable_results())
                         self.manager.log_recovery_steps(snapshot_id, transaction, index, [('window', 'launching')])
+                        launch_started = True
                         kitty = builtin_adapters({}).for_window(window)
                         kitty = kitty if kitty and kitty.name == 'kitty' else None
                         adapter_data = (selected_data or window.get('adapters', {}).get('kitty')) if kitty and isinstance(window.get('adapters'), dict) else None
                         used_session = False
+                        launched_pid: int | None = None
                         if kitty and adapter_data and kitty.validate(adapter_data) and hasattr(self.registry, 'launch_kitty_session'):
-                            adapted = kitty.execute(adapter_data, lambda session: self.registry.launch_kitty_session(entry, session))
+                            def launch_session(session: str) -> bool:
+                                nonlocal launched_pid
+                                launched = self.registry.launch_kitty_session(entry, session)
+                                if type(launched) is int and launched > 1: launched_pid = launched
+                                return bool(launched)
+                            adapted = kitty.execute(adapter_data, launch_session)
                             used_session = adapted.status.value == 'partial'
                             result['adapter_status'] = adapted.status.value
                             result['adapter_warnings'] = adapted.warnings
                             if used_session: result['kitty_structure'] = 'recreated_best_effort'
                         kitty_cwd = window.get('cwd') if kitty and window.get('cwd_source') == 'single_local_shell' else None
-                        used_cwd = bool(not used_session and isinstance(kitty_cwd, str) and hasattr(self.registry, 'launch_kitty') and self.registry.launch_kitty(entry, kitty_cwd))
+                        used_cwd = False
+                        if not used_session and isinstance(kitty_cwd, str) and hasattr(self.registry, 'launch_kitty'):
+                            launched = self.registry.launch_kitty(entry, kitty_cwd)
+                            used_cwd = bool(launched)
+                            if type(launched) is int and launched > 1: launched_pid = launched
                         if not used_cwd and not used_session:
-                            self.registry.launch(entry)
+                            if kitty and hasattr(self.registry, 'launch_kitty_plain'):
+                                launched = self.registry.launch_kitty_plain(entry)
+                                if not launched: raise RuntimeError('Could not start Kitty')
+                                if type(launched) is int and launched > 1: launched_pid = launched
+                            else:
+                                self.registry.launch(entry)
                         if used_cwd: result['terminal_cwd'] = kitty_cwd
                         deadline = time.monotonic() + self.timeout
                         while time.monotonic() < deadline:
                             time.sleep(min(0.25, max(0, deadline - time.monotonic())))
                             clients = self.backend.query('clients')
-                            match = next((c for c in clients if c.get('address') not in before and c.get('address') not in claimed and same_class(window, c)), None)
+                            match = next((c for c in clients if c.get('address') not in before and c.get('address') not in claimed and same_class(window, c) and (launched_pid is None or c.get('pid') == launched_pid)), None)
                             if match:
                                 break
                         if not match:
                             result.update(status='timeout', detail='Window did not appear; automatic retry suppressed')
+                            if is_kitty: kitty_uncertain = True
                             continue
                     address = str(match.get('address', ''))
                     if not re.fullmatch(r'0x[0-9a-fA-F]+', address):
@@ -212,7 +243,11 @@ class RecoveryExecutor:
                         detail += '; verification: ' + ', '.join(warnings)
                     result.update(status='partial', detail=detail)
                 except Exception as exc:
-                    result.update(status='error', detail=str(exc))
+                    if launch_started:
+                        result.update(status='uncertain', detail='Launch outcome is unknown; automatic retry suppressed')
+                        if is_kitty: kitty_uncertain = True
+                    else:
+                        result.update(status='error', detail=str(exc))
                 finally:
                     self.manager.run_state(snapshot_id, transaction, 'running', durable_results())
                     recorded = [('window', result['status'])]

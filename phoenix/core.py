@@ -185,11 +185,31 @@ class SnapshotManager:
         return db
 
     def save(self, state: dict[str, Any], name: str | None = None, automatic: bool = False, previews: list[dict[str, Any]] | None = None, archives: list[dict[str, Any]] | None = None) -> int:
+        state = copy.deepcopy(state)
+        previews = previews or []
+        archives = archives or []
+        def mark_archive(positions: tuple[Any, Any, Any], status: str) -> None:
+            if any(type(v) is not int or v < 0 for v in positions): return
+            try:
+                pane = state['windows'][positions[0]]['adapters']['kitty']['tabs'][positions[1]]['panes'][positions[2]]
+                if isinstance(pane, dict): pane['scrollback_capture'] = status
+            except (KeyError, IndexError, TypeError):
+                pass
+        provided = {(a.get('window'),a.get('tab'),a.get('pane')) for a in archives if isinstance(a.get('data'), bytes) and a['data'] and all(type(a.get(k)) is int and a[k] >= 0 for k in ('window','tab','pane'))}
+        for wi, window in enumerate(state.get('windows', [])):
+            if not isinstance(window, dict) or not isinstance(window.get('adapters'), dict): continue
+            kitty = window['adapters'].get('kitty')
+            if not isinstance(kitty, dict) or not isinstance(kitty.get('tabs'), list): continue
+            for ti, tab in enumerate(kitty['tabs']):
+                if not isinstance(tab, dict) or not isinstance(tab.get('panes'), list): continue
+                for pi, pane in enumerate(tab['panes']):
+                    if not isinstance(pane, dict): continue
+                    if pane.get('scrollback_capture') in ('captured', 'truncated'):
+                        original = pane['scrollback_capture']
+                        mark_archive((wi,ti,pi), ('truncated' if original == 'truncated' else 'saved') if (wi,ti,pi) in provided else 'failed')
         payload = canonical(state)
         digest = hashlib.sha256(payload.encode()).hexdigest()
         now = time.time()
-        previews = previews or []
-        archives = archives or []
         self.last_archive_warnings: list[str] = []
         images = [(p, hashlib.sha256(p['data']).hexdigest()) for p in previews]
         with lock(self.path.with_suffix('.lock')), self.connect() as db:
@@ -216,16 +236,23 @@ class SnapshotManager:
             for archive in archives:
                 data = archive.get('data')
                 positions = (archive.get('window'), archive.get('tab'), archive.get('pane'))
-                if not isinstance(data, bytes) or len(data) > pane_limit or any(type(v) is not int or v < 0 for v in positions):
+                if not isinstance(data, bytes) or not data or len(data) > pane_limit or any(type(v) is not int or v < 0 for v in positions):
+                    mark_archive(positions, 'failed')
                     self.last_archive_warnings.append('Invalid or oversized terminal archive skipped')
                     continue
                 parts = [(hashlib.sha256(data[i:i+262144]).hexdigest(), data[i:i+262144]) for i in range(0, len(data), 262144)]
-                new_parts: dict[str, tuple[int, bytes]] = {}
+                missing: dict[str, bytes] = {}
                 for key, raw in parts:
-                    if key not in new_parts and not db.execute('SELECT 1 FROM archive_chunks WHERE digest=?', (key,)).fetchone():
-                        new_parts[key] = (len(raw), zlib.compress(raw, 6))
+                    if key not in missing and not db.execute('SELECT 1 FROM archive_chunks WHERE digest=?', (key,)).fetchone():
+                        missing[key] = raw
                 used = db.execute('SELECT COALESCE(SUM(length(data)),0) FROM archive_chunks').fetchone()[0]
-                if used + sum(len(value[1]) for value in new_parts.values()) > archive_limit:
+                if missing and used >= archive_limit:
+                    mark_archive(positions, 'quota_exceeded')
+                    self.last_archive_warnings.append('Terminal archive storage limit reached; pane skipped')
+                    continue
+                new_parts = {key: (len(raw), zlib.compress(raw, 6)) for key, raw in missing.items()}
+                if new_parts and used + sum(len(value[1]) for value in new_parts.values()) > archive_limit:
+                    mark_archive(positions, 'quota_exceeded')
                     self.last_archive_warnings.append('Terminal archive storage limit reached; pane skipped')
                     continue
                 for key, (raw_size, compressed) in new_parts.items():
@@ -234,6 +261,8 @@ class SnapshotManager:
                     db.execute('INSERT INTO archive_refs VALUES(?,?,?,?,?,?)', (snapshot_id, *positions, part, key))
                 if parts:
                     db.execute('INSERT INTO archive_manifests VALUES(?,?,?,?,?,?,?)', (snapshot_id, *positions, len(parts), len(data), hashlib.sha256(data).hexdigest()))
+            payload = canonical(state)
+            db.execute('UPDATE snapshots SET payload=?,digest=? WHERE id=?', (payload, hashlib.sha256(payload.encode()).hexdigest(), snapshot_id))
             db.execute('DELETE FROM preview_images WHERE digest NOT IN (SELECT digest FROM snapshot_previews UNION SELECT digest FROM workspace_captures)')
             db.execute('DELETE FROM archive_chunks WHERE digest NOT IN (SELECT digest FROM archive_refs)')
             return snapshot_id
@@ -255,10 +284,30 @@ class SnapshotManager:
                     state = json.loads(row['payload'])
                     if not isinstance(state, dict) or not isinstance(state.get('windows'), list):
                         continue
+                    if not self.readonly:
+                        self._reconcile_archive_statuses(db, row['id'], state)
                     return dict(row), state
                 except (ValueError, TypeError):
                     continue
         raise LookupError("No valid snapshot found")
+
+    @staticmethod
+    def _reconcile_archive_statuses(db: sqlite3.Connection, snapshot_id: int, state: dict[str, Any]) -> None:
+        stored = {(r['window_index'], r['tab_index'], r['pane_index']) for r in db.execute('SELECT window_index,tab_index,pane_index FROM archive_manifests WHERE snapshot_id=?', (snapshot_id,))}
+        for wi, window in enumerate(state.get('windows', [])):
+            if not isinstance(window, dict) or not isinstance(window.get('adapters'), dict): continue
+            kitty = window['adapters'].get('kitty')
+            if not isinstance(kitty, dict) or not isinstance(kitty.get('tabs'), list): continue
+            for ti, tab in enumerate(kitty['tabs']):
+                if not isinstance(tab, dict) or not isinstance(tab.get('panes'), list): continue
+                for pi, pane in enumerate(tab['panes']):
+                    if not isinstance(pane, dict): continue
+                    status = pane.get('scrollback_capture')
+                    exists = (wi, ti, pi) in stored
+                    if status in ('captured', 'saved', 'truncated') and not exists:
+                        pane['scrollback_capture'] = 'not_saved'
+                    elif status == 'captured' and exists:
+                        pane['scrollback_capture'] = 'saved'
 
     def previews(self, snapshot_id: int, include_previous: bool = False) -> list[dict[str, Any]]:
         with self.connect() as db:
@@ -416,12 +465,13 @@ def config() -> dict[str, Any]:
 
 
 def update_config(changes: dict[str, Any]) -> None:
-    allowed = {'capture_previews', 'snapshot_retention', 'interval_seconds', 'kitty_enabled', 'kitty_scrollback', 'kitty_socket', 'kitty_scrollback_limit', 'kitty_archive_total_limit', 'kitty_exclude_panels', 'kitty_exclude_text'}
+    allowed = {'capture_previews', 'snapshot_retention', 'interval_seconds', 'kitty_enabled', 'kitty_scrollback', 'kitty_socket', 'kitty_sockets', 'kitty_scrollback_limit', 'kitty_archive_total_limit', 'kitty_exclude_panels', 'kitty_exclude_text'}
     if set(changes) - allowed:
         raise ValueError('Unknown setting')
     for key in ('capture_previews', 'kitty_enabled', 'kitty_scrollback'):
         if key in changes and not isinstance(changes[key], bool): raise ValueError('Invalid ' + key)
     if 'kitty_socket' in changes and (not isinstance(changes['kitty_socket'], str) or len(changes['kitty_socket']) > 4096): raise ValueError('Invalid socket')
+    if 'kitty_sockets' in changes and (not isinstance(changes['kitty_sockets'], list) or len(changes['kitty_sockets']) > 16 or any(not isinstance(p, str) or not p.startswith('/') or len(p) > 4096 for p in changes['kitty_sockets'])): raise ValueError('Invalid kitty_sockets')
     for key in ('kitty_exclude_panels', 'kitty_exclude_text'):
         if key in changes and (not isinstance(changes[key], list) or len(changes[key]) > 100): raise ValueError('Invalid ' + key)
     for key, low, high in [('snapshot_retention', 1, 500), ('interval_seconds', 10, 3600), ('kitty_scrollback_limit', 1024, 128 * 1024**2), ('kitty_archive_total_limit', 1024, 4 * 1024**3)]:
@@ -524,6 +574,7 @@ class Collector:
         monitor_names = {m.get('id'): m.get('name') for m in monitors}
         excluded = {str(x).casefold() for x in self.settings.get('exclude_classes', [])}
         windows = []
+        pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
         kitty_pids = [c.get('pid') for c in clients if str(c.get('class', '')).casefold() == 'kitty']
         for c in clients:
             cls = str(c.get('class') or '')
@@ -535,31 +586,54 @@ class Collector:
                 cwd = shell_cwd(c.get('pid')) if kitty_pids.count(c.get('pid')) == 1 else None
                 if cwd: w.update(cwd=cwd, cwd_source='single_local_shell')
             windows.append(w)
+            pairs.append((c, w))
         self.archives = []
         self.adapter_warnings = []
+        captured_windows: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
         if self.settings.get('kitty_enabled', False):
-            from .adapters import builtin_adapters
-            adapter = builtin_adapters(self.settings).get('kitty')
-            candidates = [c for c in clients if str(c.get('class', '')).casefold() == 'kitty' and c.get('mapped', True)]
-            matching = [w for w in windows if str(w.get('class', '')).casefold() == 'kitty']
-            if len(candidates) == 1 and len(matching) == 1 and adapter:
-                pid = candidates[0].get('pid')
-                if type(pid) is int and pid > 0:
-                    result, captured = adapter.collect(bool(self.settings.get('kitty_scrollback', False)), expected_pid=pid)
+            from .adapters.kitty import KittyAdapter, KittyError, MAX_CAPTURE_BATCH
+            single = self.settings.get('kitty_socket') or os.environ.get('PHOENIX_KITTY_SOCKET', '')
+            configured = self.settings.get('kitty_sockets', [])
+            if not isinstance(configured, list): configured = []
+            paths = list(dict.fromkeys(x for x in [single, *configured] if isinstance(x, str) and x))[:16]
+            if not paths: self.adapter_warnings.append('No Kitty socket configured')
+            deadline = time.monotonic() + 15
+            batch_left = MAX_CAPTURE_BATCH
+            matched: set[int] = set()
+            candidates = [(c, w) for c, w in pairs if str(c.get('class', '')).casefold() == 'kitty']
+            all_kitties = [c for c in clients if str(c.get('class', '')).casefold() == 'kitty' and c.get('mapped', True)]
+            for path in paths:
+                if time.monotonic() >= deadline:
+                    self.adapter_warnings.append('Kitty collection time limit reached'); break
+                adapter = KittyAdapter(dict(self.settings, kitty_socket=path))
+                try:
+                    pid = adapter.peer_pid()
+                    matches = [(c, w) for c, w in candidates if c.get('pid') == pid]
+                    if pid in matched: continue
+                    if len(matches) != 1 or sum(c.get('pid') == pid for c in all_kitties) != 1:
+                        self.adapter_warnings.append('Kitty process has ambiguous or excluded OS windows; detailed collection skipped')
+                        continue
+                    client, window = matches[0]
+                    address = client.get('address')
+                    if not isinstance(address, str) or not re.fullmatch(r'0x[0-9a-fA-F]+', address):
+                        self.adapter_warnings.append('Kitty window cannot be identified during collection'); continue
+                    result, captured = adapter.collect(bool(self.settings.get('kitty_scrollback', False)), expected_pid=pid, deadline=deadline, memory_budget=batch_left)
                     self.adapter_warnings.extend(result.warnings)
-                    if result.data:
-                        matching[0]['adapters'] = {'kitty': adapter.serialize(result.data)}
-                        matching[0]['adapter_status'] = result.status.value
-                else: captured = []
-            else:
-                captured = []
-                self.adapter_warnings.append('Detailed Kitty collection requires one unambiguous Kitty OS window')
-        else:
-            captured = []
+                    if not result.data: continue
+                    # Prevent attaching captured state to a replaced or newly ambiguous window.
+                    current = [c for c in self.backend.query('clients') if str(c.get('class', '')).casefold() == 'kitty' and c.get('mapped', True) and c.get('pid') == pid]
+                    if len(current) != 1 or current[0].get('address') != address or adapter.peer_pid() != pid:
+                        self.adapter_warnings.append('Kitty window or socket changed during collection; detailed state discarded'); continue
+                    window['adapters'] = {'kitty': adapter.serialize(result.data)}
+                    window['adapter_status'] = result.status.value
+                    captured_windows.append((window, captured)); matched.add(pid)
+                    batch_left -= sum(len(a['data']) for a in captured)
+                except (KittyError, RuntimeError) as exc:
+                    self.adapter_warnings.append(str(exc))
         windows.sort(key=canonical)
-        if captured and len(matching) == 1:
-            index = windows.index(matching[0])
-            self.archives = [dict(a, window=index) for a in captured]
+        for window, captured in captured_windows:
+            index = next(i for i, candidate in enumerate(windows) if candidate is window)
+            self.archives.extend(dict(a, window=index) for a in captured)
         return {'schema': SCHEMA, 'windows': windows, 'monitors': [{k: m.get(k) for k in ('name', 'x', 'y', 'width', 'height', 'scale', 'transform')} for m in sorted(monitors, key=lambda item: str(item.get('name', '')))], 'workspaces': [{'id': w.get('id'), 'name': w.get('name'), 'monitor': w.get('monitor')} for w in sorted(workspaces, key=lambda item: str(item.get('id', '')))]}
 
 
@@ -639,7 +713,7 @@ class DesktopRegistry:
                 continue
         return None
 
-    def launch_kitty_session(self, entry: Path, session: str) -> bool:
+    def launch_kitty_session(self, entry: Path, session: str) -> int | None:
         binary = Path('/usr/bin/kitty')
         try:
             st = binary.stat()
@@ -648,22 +722,32 @@ class DesktopRegistry:
             # Prepare input before spawning; no ambiguous partial write after launch.
             with tempfile.TemporaryFile() as source:
                 source.write(session.encode('utf-8')); source.seek(0)
-                subprocess.Popen([str(binary), '--session', '-'], stdin=source, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-            return True
+                proc = subprocess.Popen([str(binary), '--session', '-'], stdin=source, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            return proc.pid
         except OSError:
             return False
 
-    def launch_kitty(self, entry: Path, cwd: str) -> bool:
+    def launch_kitty(self, entry: Path, cwd: str) -> int | None:
         binary = Path('/usr/bin/kitty')
         try:
             st = binary.stat()
             directory = Path(cwd)
             if not self.allowed(entry) or st.st_uid != 0 or st.st_mode & 0o022 or not directory.is_absolute() or not directory.is_dir():
                 return False
-            subprocess.Popen([str(binary), '--directory', str(directory)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-            return True
+            proc = subprocess.Popen([str(binary), '--directory', str(directory)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            return proc.pid
         except OSError:
             return False
+
+    def launch_kitty_plain(self, entry: Path) -> int | None:
+        binary = Path('/usr/bin/kitty')
+        try:
+            st = binary.stat()
+            if not self.allowed(entry) or st.st_uid != 0 or st.st_mode & 0o022:
+                return None
+            return subprocess.Popen([str(binary)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True).pid
+        except OSError:
+            return None
 
     def launch(self, entry: Path) -> None:
         if not self.allowed(entry):

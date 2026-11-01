@@ -202,8 +202,9 @@ def test_collector_attaches_state_and_archive_to_same_sorted_window(monkeypatch)
     from phoenix.adapters.base import AdapterResult, Status
     d={'version':1,'active_tab':0,'tabs':[{'layout':'tall','active_pane':0,'panes':[{'cwd':'/tmp','process':'unknown'}]}]}
     monkeypatch.setattr(KittyAdapter,'collect',lambda self,*a,**k:(AdapterResult(Status.PARTIAL,d),[{'tab':0,'pane':0,'data':b'content'}]))
-    b=FakeBackend([{'class':'kitty','pid':1,'workspace':{'id':1}},{'class':'aaa','workspace':{'id':2}}])
-    c=Collector(b,{'kitty_enabled':True,'kitty_scrollback':True}); snap=c.collect()
+    monkeypatch.setattr(KittyAdapter,'peer_pid',lambda self:1)
+    b=FakeBackend([{'class':'kitty','pid':1,'address':'0xabc','workspace':{'id':1}},{'class':'aaa','workspace':{'id':2}}])
+    c=Collector(b,{'kitty_enabled':True,'kitty_scrollback':True,'kitty_socket':'/tmp/test.sock'}); snap=c.collect()
     index=c.archives[0]['window']
     assert snap['windows'][index]['class']=='kitty' and snap['windows'][index]['adapters']['kitty']==d
 
@@ -262,3 +263,45 @@ def test_recovery_plan_reflects_selected_panes_and_open_window(tmp_path):
     statuses={step['id']:step['status'] for step in plan[0]['steps']}
     assert statuses['pane:0:0']=='unverified' and statuses['pane:0:1']=='skipped'
     assert executor.restore(sid,snap,dry_run=True,selected=set())[0]['action']=='skip'
+
+
+def test_persisted_status_matches_archive_quota_and_truncation(tmp_path,monkeypatch):
+    monkeypatch.setenv('XDG_CONFIG_HOME',str(tmp_path/'config'))
+    update_config({'kitty_archive_total_limit':1024,'kitty_scrollback_limit':2048})
+    def snap(status):
+        return {'schema':1,'windows':[{'class':'kitty','adapters':{'kitty':{'version':1,'active_tab':0,'tabs':[{'layout':'tall','active_pane':0,'panes':[{'cwd':None,'process':'unknown','scrollback_capture':status}]}]}}}]}
+    m=SnapshotManager(tmp_path/'db')
+    def status(sid): return m.get(sid)[1]['windows'][0]['adapters']['kitty']['tabs'][0]['panes'][0]['scrollback_capture']
+    a=m.save(snap('captured'),archives=[{'window':0,'tab':0,'pane':0,'data':os.urandom(1500)}])
+    assert status(a)=='quota_exceeded' and m.archives(a)==[]
+    b=m.save(snap('captured'),archives=[{'window':0,'tab':0,'pane':0,'data':b'hello'}])
+    assert status(b)=='saved' and m.archive_text(b,0,0,0)==b'hello'
+    c=m.save(snap('truncated'),archives=[{'window':0,'tab':0,'pane':0,'data':b'part'}])
+    assert status(c)=='truncated' and m.archive_text(c,0,0,0)==b'part'
+    d=m.save(snap('captured'),archives=[])
+    assert status(d)=='failed' and m.archives(d)==[]
+
+
+def test_archive_status_tracks_purge_without_rewriting_old_snapshot(tmp_path):
+    m=SnapshotManager(tmp_path/'db')
+    data={'version':1,'active_tab':0,'tabs':[{'layout':'tall','active_pane':0,'panes':[{'cwd':None,'process':'other','scrollback_capture':'captured'}]}]}
+    state={'schema':1,'windows':[{'class':'kitty','adapters':{'kitty':data}}]}
+    sid=m.save(state,archives=[{'window':0,'tab':0,'pane':0,'data':b'history'}])
+    def status(): return m.get(sid)[1]['windows'][0]['adapters']['kitty']['tabs'][0]['panes'][0]['scrollback_capture']
+    assert status()=='saved'
+    m.purge_archives()
+    assert status()=='not_saved'
+    assert m.integrity()=='ok'
+
+
+def test_full_quota_reuses_chunks_without_recompression(tmp_path,monkeypatch):
+    monkeypatch.setenv('XDG_CONFIG_HOME',str(tmp_path/'config'))
+    update_config({'kitty_archive_total_limit':2048,'kitty_scrollback_limit':2048})
+    m=SnapshotManager(tmp_path/'db'); content=os.urandom(1500); state={'schema':1,'windows':[{'class':'kitty'}]}
+    record={'window':0,'tab':0,'pane':0,'data':content}
+    first=m.save(state,archives=[record]); update_config({'kitty_archive_total_limit':1024})
+    import phoenix.core as core
+    monkeypatch.setattr(core.zlib,'compress',lambda *a,**k: (_ for _ in ()).throw(AssertionError('unexpected compression')))
+    second=m.save(state,archives=[record]); assert m.archive_text(second,0,0,0)==content
+    third=m.save(state,archives=[dict(record,data=os.urandom(1200))]); assert m.archives(third)==[] and m.last_archive_warnings
+    assert m.archive_text(first,0,0,0)==content

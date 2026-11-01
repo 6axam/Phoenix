@@ -69,7 +69,8 @@ def test_matching_duplicate_windows_and_repeat(tmp_path):
     backend = FakeBackend(); registry = FakeRegistry(backend); ex = RecoveryExecutor(backend, registry, m, .1)
     assert [r['status'] for r in ex.restore(sid, s)] == ['partial', 'partial']
     assert registry.launches == 2
-    assert [r['status'] for r in ex.restore(sid, s)] == ['partial', 'partial']
+    # Existing same-class Kitty windows cannot be identified reliably.
+    assert [r['status'] for r in ex.restore(sid, s)] == ['uncertain', 'uncertain']
     assert registry.launches == 2
 
 
