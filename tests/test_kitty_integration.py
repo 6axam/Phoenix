@@ -13,18 +13,31 @@ pytestmark = pytest.mark.skipif(os.environ.get('PHOENIX_KITTY_INTEGRATION') != '
 
 
 @pytest.fixture
-def kitty_factory(tmp_path):
+def kitty_factory(tmp_path, monkeypatch):
+    for key in ('DATA','CONFIG','STATE'):
+        monkeypatch.setenv('XDG_'+key+'_HOME',str(tmp_path/key.lower()))
+    home=tmp_path/'home'; home.mkdir(exist_ok=True)
     directory=tmp_path/'s'; directory.mkdir(mode=0o700); processes=[]
     def launch(name,session):
         sock=directory/(name+'.sock')
-        p=subprocess.Popen(['kitty','--config','NONE','-o','allow_remote_control=socket-only','--listen-on','unix:'+str(sock),'--session','-'],stdin=subprocess.PIPE,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
+        environment=os.environ.copy(); environment.update({'HOME':str(home),'HISTFILE':'/dev/null'})
+        p=subprocess.Popen(['kitty','--config','NONE','-o','shell=/bin/bash --noprofile --norc','-o','allow_remote_control=socket-only','--listen-on','unix:'+str(sock),'--session','-'],stdin=subprocess.PIPE,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True,env=environment)
         processes.append(p)
         assert p.stdin is not None
         p.stdin.write(session.encode()); p.stdin.close()
         deadline=time.monotonic()+8
-        while not sock.exists() and time.monotonic()<deadline: time.sleep(.05)
-        if not sock.exists(): raise RuntimeError('Temporary Kitty socket did not start')
-        return p,str(sock)
+        expected_panes=sum(line.strip().startswith('launch') for line in session.splitlines())
+        expected_os=1+sum(line.strip()=='new_os_window' for line in session.splitlines())
+        while time.monotonic()<deadline:
+            if sock.exists():
+                try:
+                    response=subprocess.run(['kitten','@','--to','unix:'+str(sock),'ls'],capture_output=True,text=True,timeout=2,check=True)
+                    windows=json.loads(response.stdout)
+                    panes=sum(len(tab.get('windows',[])) for window in windows for tab in window.get('tabs',[]))
+                    if len(windows)>=expected_os and panes>=expected_panes: return p,str(sock)
+                except (OSError,subprocess.SubprocessError,ValueError): pass
+            time.sleep(.05)
+        raise RuntimeError('Temporary Kitty did not finish opening its test panels')
     yield launch
     for process in processes:
         if process.poll() is None: process.terminate()
