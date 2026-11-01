@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import configparser
+import copy
 import contextlib
 import fcntl
 import hashlib
@@ -16,6 +17,7 @@ import tempfile
 import stat
 import time
 import zlib
+import uuid
 from typing import Any, Iterator
 
 LOG = logging.getLogger("phoenix")
@@ -47,9 +49,45 @@ def lock(path: Path, blocking: bool = True) -> Iterator[None]:
         os.close(fd)
 
 
+def running_daemons_for(database: Path) -> list[int]:
+    """Find other same-user Phoenix daemons that use this XDG data directory."""
+    found: list[int] = []
+    for proc in Path('/proc').iterdir():
+        if not proc.name.isdigit() or int(proc.name) == os.getpid(): continue
+        args: list[bytes] = []
+        try:
+            if proc.stat().st_uid != os.getuid(): continue
+            with (proc / 'cmdline').open('rb') as cmdline:
+                args = cmdline.read(8192).split(b'\0')
+            if not (len(args) >= 4 and args[1:4] == [b'-m', b'phoenix', b'daemon']): continue
+            with (proc / 'environ').open('rb') as environment:
+                raw_environment = environment.read(1024 * 1024 + 1)
+            if len(raw_environment) > 1024 * 1024:
+                raise RuntimeError('Cannot verify a running Phoenix daemon; stop it before migration')
+            entries = raw_environment.split(b'\0')
+            value = next((item.split(b'=', 1)[1] for item in entries if item.startswith(b'XDG_DATA_HOME=')), b'')
+            base = Path(os.fsdecode(value)) if value else Path.home() / '.local/share'
+            if (base / 'phoenix' / 'snapshots.sqlite3').resolve() == database.resolve(): found.append(int(proc.name))
+        except FileNotFoundError:
+            continue  # Process exited while enumerating.
+        except (OSError, ValueError):
+            # A same-user daemon whose data path cannot be checked must not be ignored.
+            if len(args) >= 4 and args[1:4] == [b'-m', b'phoenix', b'daemon']:
+                raise RuntimeError('Cannot verify a running Phoenix daemon; stop it before migration')
+    return found
+
+
 class SnapshotManager:
-    def __init__(self, path: Path | None = None):
+    def __init__(self, path: Path | None = None, *, legacy_readonly: bool = False):
         self.path = path or xdg("DATA") / "snapshots.sqlite3"
+        self.readonly = False
+        new_database = not self.path.exists() or self.path.stat().st_size == 0
+        # Diagnostics can inspect a v4 database without upgrading it or touching WAL.
+        if legacy_readonly and self.path.exists():
+            with contextlib.closing(sqlite3.connect(self.path.resolve().as_uri() + '?mode=ro', uri=True, timeout=15)) as probe:
+                if probe.execute('PRAGMA user_version').fetchone()[0] == 4:
+                    self.readonly = True
+                    return
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         fd = os.open(self.path, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
         os.close(fd)
@@ -83,20 +121,65 @@ class SnapshotManager:
                 PRAGMA user_version=4;
                 COMMIT;''')
                 version = 4
-            if version == 4:
-                db.executescript('''BEGIN IMMEDIATE;
-                CREATE TABLE IF NOT EXISTS recovery_steps (transaction_id TEXT NOT NULL, snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE, window_index INTEGER NOT NULL, step_id TEXT NOT NULL, status TEXT NOT NULL, updated REAL NOT NULL, PRIMARY KEY(transaction_id, window_index, step_id));
-                CREATE TABLE IF NOT EXISTS archive_chunks (digest TEXT PRIMARY KEY, raw_size INTEGER NOT NULL, data BLOB NOT NULL);
-                CREATE TABLE IF NOT EXISTS archive_manifests (snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE, window_index INTEGER NOT NULL, tab_index INTEGER NOT NULL, pane_index INTEGER NOT NULL, parts INTEGER NOT NULL, raw_size INTEGER NOT NULL, digest TEXT NOT NULL, PRIMARY KEY(snapshot_id,window_index,tab_index,pane_index));
-                CREATE TABLE IF NOT EXISTS archive_refs (snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE, window_index INTEGER NOT NULL, tab_index INTEGER NOT NULL, pane_index INTEGER NOT NULL, part INTEGER NOT NULL, digest TEXT NOT NULL REFERENCES archive_chunks(digest), PRIMARY KEY(snapshot_id,window_index,tab_index,pane_index,part));
-                PRAGMA user_version=5;
-                COMMIT;''')
+            if version == 4 and new_database:
+                self._upgrade_v4(db)
+            elif version == 4:
+                default_path = Path(os.environ.get('XDG_DATA_HOME', Path.home() / '.local/share')) / 'phoenix' / 'snapshots.sqlite3'
+                guard = lock(xdg('STATE') / 'daemon.lock', blocking=False) if self.path.resolve() == default_path.resolve() else contextlib.nullcontext()
+                try:
+                    with guard, lock(self.path.with_suffix('.lock')):
+                        if self.path.resolve() == default_path.resolve() and running_daemons_for(self.path):
+                            raise RuntimeError('Cannot migrate while another Phoenix daemon uses this database; stop it first, then retry')
+                        if db.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
+                            raise RuntimeError('Source database failed integrity_check')
+                        backup = self._backup_before_v5(db)
+                        try:
+                            self._upgrade_v4(db)
+                        except BaseException:
+                            db.rollback()
+                            raise
+                        LOG.info('Schema 4 backup preserved: %s', backup)
+                except BlockingIOError as exc:
+                    raise RuntimeError('Cannot migrate while Phoenix daemon is running; stop it first, then retry') from exc
+                except (sqlite3.Error, OSError) as exc:
+                    raise RuntimeError('Schema 4 migration failed; the source database was not intentionally replaced') from exc
+
+    def _backup_before_v5(self, source: sqlite3.Connection) -> Path:
+        directory = self.path.parent / 'backups' / 'migrations'
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(directory, 0o700)
+        fd, temporary = tempfile.mkstemp(prefix='.v4-', suffix='.sqlite3', dir=directory)
+        os.close(fd)
+        try:
+            with contextlib.closing(sqlite3.connect(temporary)) as target:
+                source.backup(target)
+                if target.execute('PRAGMA integrity_check').fetchone()[0] != 'ok' or target.execute('PRAGMA user_version').fetchone()[0] != 4:
+                    raise RuntimeError('Schema 4 backup verification failed; migration cancelled')
+            with open(temporary, 'rb') as saved: os.fsync(saved.fileno())
+            final = directory / ('schema4-' + uuid.uuid4().hex + '.sqlite3')
+            os.replace(temporary, final)
+            fd_dir = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try: os.fsync(fd_dir)
+            finally: os.close(fd_dir)
+            return final
+        finally:
+            if os.path.exists(temporary): os.unlink(temporary)
+
+    def _upgrade_v4(self, db: sqlite3.Connection) -> None:
+        db.executescript('''BEGIN IMMEDIATE;
+        CREATE TABLE IF NOT EXISTS recovery_steps (transaction_id TEXT NOT NULL, snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE, window_index INTEGER NOT NULL, step_id TEXT NOT NULL, status TEXT NOT NULL, updated REAL NOT NULL, PRIMARY KEY(transaction_id, window_index, step_id));
+        CREATE TABLE IF NOT EXISTS archive_chunks (digest TEXT PRIMARY KEY, raw_size INTEGER NOT NULL, data BLOB NOT NULL);
+        CREATE TABLE IF NOT EXISTS archive_manifests (snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE, window_index INTEGER NOT NULL, tab_index INTEGER NOT NULL, pane_index INTEGER NOT NULL, parts INTEGER NOT NULL, raw_size INTEGER NOT NULL, digest TEXT NOT NULL, PRIMARY KEY(snapshot_id,window_index,tab_index,pane_index));
+        CREATE TABLE IF NOT EXISTS archive_refs (snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE, window_index INTEGER NOT NULL, tab_index INTEGER NOT NULL, pane_index INTEGER NOT NULL, part INTEGER NOT NULL, digest TEXT NOT NULL REFERENCES archive_chunks(digest), PRIMARY KEY(snapshot_id,window_index,tab_index,pane_index,part));
+        PRAGMA user_version=5;
+        COMMIT;''')
 
     def connect(self) -> sqlite3.Connection:
-        db = sqlite3.connect(self.path, timeout=15)
+        db = sqlite3.connect(self.path.resolve().as_uri() + '?mode=ro', uri=True, timeout=15) if self.readonly else sqlite3.connect(self.path, timeout=15)
         db.row_factory = sqlite3.Row
-        db.execute("PRAGMA journal_mode=WAL")
-        db.execute("PRAGMA synchronous=FULL")
+        if not self.readonly:
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("PRAGMA synchronous=FULL")
         db.execute("PRAGMA foreign_keys=ON")
         db.execute("PRAGMA busy_timeout=15000")
         return db

@@ -5,6 +5,7 @@ import logging
 import os
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -91,7 +92,7 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s %(message)s')
     args = parser().parse_args(argv)
     try:
-        manager = SnapshotManager(); backend = HyprlandBackend()
+        manager = SnapshotManager(legacy_readonly=args.command in ('status', 'history', 'inspect', 'doctor')); backend = HyprlandBackend()
         if args.command == 'snapshot':
             collector = Collector(backend); state = collector.collect()
             if not state['windows']: raise RuntimeError('Refusing to save an empty snapshot')
@@ -146,7 +147,7 @@ def main(argv: list[str] | None = None) -> int:
             from .gui import run
             return run(manager, backend, args.prompt)
         return 0
-    except (OSError, RuntimeError, LookupError, ValueError, ImportError, BlockingIOError) as exc:
+    except (OSError, RuntimeError, LookupError, ValueError, ImportError, BlockingIOError, sqlite3.Error) as exc:
         print(f'phoenix: {exc}', file=sys.stderr); return 1
 
 if __name__ == '__main__':
