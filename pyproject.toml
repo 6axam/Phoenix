@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "phoenix-session"
-version = "0.1.0"
+version = "1.1.0a1"
 description = "Conservative Hyprland session snapshots"
 requires-python = ">=3.11"
 

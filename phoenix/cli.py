@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+from .adapters import builtin_adapters
 from .capture import capture_previews
 from .core import Collector, DesktopRegistry, HyprlandBackend, SnapshotManager, config, lock, trust_desktop, xdg
 from .recovery import RecoveryExecutor
@@ -29,6 +30,12 @@ def parser() -> argparse.ArgumentParser:
     sub.add_parser('daemon', help='Запустить периодические снимки и запрос при входе')
     sub.add_parser('config', help='Показать настройки и путь')
     sub.add_parser('backup', help='Создать проверенную резервную копию')
+    recovery_log = sub.add_parser('recovery-log', help='Журнал шагов восстановления'); recovery_log.add_argument('snapshot', nargs='?', default='latest')
+    archive = sub.add_parser('archive', help='Просмотр и удаление архивов терминала')
+    archive_sub = archive.add_subparsers(dest='archive_command', required=True)
+    archive_list = archive_sub.add_parser('list'); archive_list.add_argument('snapshot', nargs='?', default='latest')
+    archive_show = archive_sub.add_parser('show'); archive_show.add_argument('snapshot'); archive_show.add_argument('window', type=int); archive_show.add_argument('tab', type=int); archive_show.add_argument('pane', type=int)
+    archive_purge = archive_sub.add_parser('purge'); archive_purge.add_argument('--confirm', action='store_true', required=True, help='Удалить все архивы из текущей базы')
     trust = sub.add_parser('trust-desktop', help='Доверять конкретному desktop-файлу до его изменения'); trust.add_argument('path', help='Абсолютный путь к desktop-файлу')
     return p
 
@@ -65,9 +72,11 @@ def daemon(manager: SnapshotManager, backend: HyprlandBackend) -> int:
         while not stop.is_set():
             try:
                 if decided():
-                    state = Collector(backend).collect()
+                    collector = Collector(backend)
+                    state = collector.collect()
                     if state['windows']:
-                        manager.save(state, automatic=True, previews=capture_previews(backend, config()))
+                        manager.save(state, automatic=True, previews=capture_previews(backend, config()), archives=collector.archives)
+                        for warning in manager.last_archive_warnings: logging.warning('%s', warning)
                     manager.backup_if_due()
                 else:
                     logging.warning('Snapshots paused until a session decision is made')
@@ -84,9 +93,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         manager = SnapshotManager(); backend = HyprlandBackend()
         if args.command == 'snapshot':
-            state = Collector(backend).collect()
+            collector = Collector(backend); state = collector.collect()
             if not state['windows']: raise RuntimeError('Refusing to save an empty snapshot')
-            print(manager.save(state, name=args.name, previews=capture_previews(backend, config())))
+            print(manager.save(state, name=args.name, previews=capture_previews(backend, config()), archives=collector.archives))
+            for warning in collector.adapter_warnings + manager.last_archive_warnings: print('phoenix:', warning, file=sys.stderr)
         elif args.command == 'history': dump(manager.history())
         elif args.command == 'inspect':
             row, state = manager.get(args.snapshot); dump({'id': row['id'], 'state': state})
@@ -113,12 +123,23 @@ def main(argv: list[str] | None = None) -> int:
                 from gi.repository import Gtk  # noqa: F401
                 checks['gtk4'] = True
             except (ImportError, ValueError): checks['gtk4'] = False
-            checks['integrity'] = manager.integrity(); dump(checks)
+            checks['integrity'] = manager.integrity(); checks['adapters'] = builtin_adapters(config()).diagnostics(); dump(checks)
         elif args.command == 'trust-desktop':
             from pathlib import Path
             trust_desktop(Path(args.path))
             print('Desktop entry trusted:', args.path)
         elif args.command == 'backup': print(manager.backup())
+        elif args.command == 'recovery-log':
+            row, _ = manager.get(args.snapshot); dump(manager.recovery_log(row['id']))
+        elif args.command == 'archive':
+            if args.archive_command == 'purge':
+                manager.purge_archives(); print('Архивы удалены из текущей базы; резервные копии не изменены.')
+            else:
+                row, _ = manager.get(args.snapshot)
+                if args.archive_command == 'list': dump(manager.archives(row['id']))
+                else:
+                    from .text import safe_text
+                    print(safe_text(manager.archive_text(row['id'], args.window, args.tab, args.pane)), end='')
         elif args.command == 'config': dump({'path': str(xdg('CONFIG') / 'config.json'), 'settings': config()})
         elif args.command == 'daemon': return daemon(manager, backend)
         elif args.command == 'gui':
