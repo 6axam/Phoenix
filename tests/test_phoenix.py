@@ -55,11 +55,11 @@ def test_corrupted_latest_fallback(tmp_path):
 def test_schema_migration_and_future_rejection(tmp_path):
     path = tmp_path / 'db'; sqlite3.connect(path).close()
     m = SnapshotManager(path)
-    with m.connect() as db: assert db.execute('PRAGMA user_version').fetchone()[0] == 4
+    with m.connect() as db: assert db.execute('PRAGMA user_version').fetchone()[0] == 5
     with m.connect() as db:
         db.execute('DROP TABLE workspace_captures'); db.execute('DROP TABLE snapshot_previews'); db.execute('DROP TABLE preview_images'); db.execute('ALTER TABLE snapshots DROP COLUMN pinned'); db.execute('PRAGMA user_version=1')
     m = SnapshotManager(path)
-    with m.connect() as db: assert db.execute('PRAGMA user_version').fetchone()[0] == 4
+    with m.connect() as db: assert db.execute('PRAGMA user_version').fetchone()[0] == 5
     with m.connect() as db: db.execute('PRAGMA user_version=999')
     with pytest.raises(ValueError): SnapshotManager(path)
 
@@ -297,7 +297,7 @@ def test_schema_two_to_three_preserves_existing_previews(tmp_path):
         db.execute('PRAGMA user_version=2')
     migrated = SnapshotManager(path)
     assert migrated.previews(sid)[0]['data'] == b'image'
-    with migrated.connect() as db: assert db.execute('PRAGMA user_version').fetchone()[0] == 4
+    with migrated.connect() as db: assert db.execute('PRAGMA user_version').fetchone()[0] == 5
 
 
 def test_earlier_capture_can_reuse_periodic_snapshot_image(tmp_path):

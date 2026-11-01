@@ -15,11 +15,12 @@ import subprocess
 import tempfile
 import stat
 import time
+import zlib
 from typing import Any, Iterator
 
 LOG = logging.getLogger("phoenix")
 SCHEMA = 1
-DB_SCHEMA = 4
+DB_SCHEMA = 5
 
 
 def xdg(kind: str) -> Path:
@@ -81,6 +82,15 @@ class SnapshotManager:
                 ALTER TABLE snapshots ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;
                 PRAGMA user_version=4;
                 COMMIT;''')
+                version = 4
+            if version == 4:
+                db.executescript('''BEGIN IMMEDIATE;
+                CREATE TABLE IF NOT EXISTS recovery_steps (transaction_id TEXT NOT NULL, snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE, window_index INTEGER NOT NULL, step_id TEXT NOT NULL, status TEXT NOT NULL, updated REAL NOT NULL, PRIMARY KEY(transaction_id, window_index, step_id));
+                CREATE TABLE IF NOT EXISTS archive_chunks (digest TEXT PRIMARY KEY, raw_size INTEGER NOT NULL, data BLOB NOT NULL);
+                CREATE TABLE IF NOT EXISTS archive_manifests (snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE, window_index INTEGER NOT NULL, tab_index INTEGER NOT NULL, pane_index INTEGER NOT NULL, parts INTEGER NOT NULL, raw_size INTEGER NOT NULL, digest TEXT NOT NULL, PRIMARY KEY(snapshot_id,window_index,tab_index,pane_index));
+                CREATE TABLE IF NOT EXISTS archive_refs (snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE, window_index INTEGER NOT NULL, tab_index INTEGER NOT NULL, pane_index INTEGER NOT NULL, part INTEGER NOT NULL, digest TEXT NOT NULL REFERENCES archive_chunks(digest), PRIMARY KEY(snapshot_id,window_index,tab_index,pane_index,part));
+                PRAGMA user_version=5;
+                COMMIT;''')
 
     def connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.path, timeout=15)
@@ -91,28 +101,58 @@ class SnapshotManager:
         db.execute("PRAGMA busy_timeout=15000")
         return db
 
-    def save(self, state: dict[str, Any], name: str | None = None, automatic: bool = False, previews: list[dict[str, Any]] | None = None) -> int:
+    def save(self, state: dict[str, Any], name: str | None = None, automatic: bool = False, previews: list[dict[str, Any]] | None = None, archives: list[dict[str, Any]] | None = None) -> int:
         payload = canonical(state)
         digest = hashlib.sha256(payload.encode()).hexdigest()
         now = time.time()
         previews = previews or []
+        archives = archives or []
+        self.last_archive_warnings: list[str] = []
         images = [(p, hashlib.sha256(p['data']).hexdigest()) for p in previews]
         with lock(self.path.with_suffix('.lock')), self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             last = db.execute("SELECT id,digest FROM snapshots WHERE automatic=1 ORDER BY id DESC LIMIT 1").fetchone() if automatic else None
             old_images = [(r['workspace'], r['monitor'], r['digest']) for r in db.execute('SELECT workspace, monitor, digest FROM snapshot_previews WHERE snapshot_id=? ORDER BY workspace,monitor', (last['id'],))] if last else []
             new_images = sorted((p['workspace'], p['monitor'], image_digest) for p, image_digest in images)
-            if last and last['digest'] == digest and old_images == new_images:
+            old_archives = [(r['window_index'], r['tab_index'], r['pane_index'], r['raw_size'], r['digest']) for r in db.execute('SELECT window_index,tab_index,pane_index,raw_size,digest FROM archive_manifests WHERE snapshot_id=? ORDER BY window_index,tab_index,pane_index', (last['id'],))] if last else []
+            valid_archives = all(isinstance(a.get('data'), bytes) and len(a['data']) > 0 and all(type(a.get(k)) is int and a[k] >= 0 for k in ('window','tab','pane')) for a in archives)
+            new_archives = sorted((a['window'], a['tab'], a['pane'], len(a['data']), hashlib.sha256(a['data']).hexdigest()) for a in archives) if valid_archives else None
+            if last and last['digest'] == digest and old_images == new_images and old_archives == new_archives:
                 db.execute("UPDATE snapshots SET checked=? WHERE id=?", (now, last['id']))
                 return int(last['id'])
             cursor = db.execute("INSERT INTO snapshots(created,checked,name,automatic,schema_version,payload,digest) VALUES(?,?,?,?,?,?,?)", (now, now, name, int(automatic), SCHEMA, payload, digest))
             snapshot_id = int(cursor.lastrowid or 0)
+            limit = max(1, min(500, int(config().get('snapshot_retention', 60))))
+            db.execute("DELETE FROM snapshots WHERE automatic=1 AND pinned=0 AND id NOT IN (SELECT id FROM snapshots WHERE automatic=1 AND pinned=0 ORDER BY id DESC LIMIT ?)", (limit,))
+            db.execute('DELETE FROM archive_chunks WHERE digest NOT IN (SELECT digest FROM archive_refs)')
             for preview, image_digest in images:
                 db.execute('INSERT OR IGNORE INTO preview_images VALUES(?,?)', (image_digest, preview['data']))
                 db.execute('INSERT INTO snapshot_previews VALUES(?,?,?,?,?)', (snapshot_id, preview['workspace'], preview['monitor'], preview['captured'], image_digest))
-            limit = max(1, min(500, int(config().get('snapshot_retention', 60))))
-            db.execute("DELETE FROM snapshots WHERE automatic=1 AND pinned=0 AND id NOT IN (SELECT id FROM snapshots WHERE automatic=1 AND pinned=0 ORDER BY id DESC LIMIT ?)", (limit,))
+            archive_limit = max(1024, min(4 * 1024**3, int(config().get('kitty_archive_total_limit', 1024**3))))
+            pane_limit = max(1024, min(128 * 1024**2, int(config().get('kitty_scrollback_limit', 32 * 1024**2))))
+            for archive in archives:
+                data = archive.get('data')
+                positions = (archive.get('window'), archive.get('tab'), archive.get('pane'))
+                if not isinstance(data, bytes) or len(data) > pane_limit or any(type(v) is not int or v < 0 for v in positions):
+                    self.last_archive_warnings.append('Invalid or oversized terminal archive skipped')
+                    continue
+                parts = [(hashlib.sha256(data[i:i+262144]).hexdigest(), data[i:i+262144]) for i in range(0, len(data), 262144)]
+                new_parts: dict[str, tuple[int, bytes]] = {}
+                for key, raw in parts:
+                    if key not in new_parts and not db.execute('SELECT 1 FROM archive_chunks WHERE digest=?', (key,)).fetchone():
+                        new_parts[key] = (len(raw), zlib.compress(raw, 6))
+                used = db.execute('SELECT COALESCE(SUM(length(data)),0) FROM archive_chunks').fetchone()[0]
+                if used + sum(len(value[1]) for value in new_parts.values()) > archive_limit:
+                    self.last_archive_warnings.append('Terminal archive storage limit reached; pane skipped')
+                    continue
+                for key, (raw_size, compressed) in new_parts.items():
+                    db.execute('INSERT OR IGNORE INTO archive_chunks VALUES(?,?,?)', (key, raw_size, compressed))
+                for part, (key, _) in enumerate(parts):
+                    db.execute('INSERT INTO archive_refs VALUES(?,?,?,?,?,?)', (snapshot_id, *positions, part, key))
+                if parts:
+                    db.execute('INSERT INTO archive_manifests VALUES(?,?,?,?,?,?,?)', (snapshot_id, *positions, len(parts), len(data), hashlib.sha256(data).hexdigest()))
             db.execute('DELETE FROM preview_images WHERE digest NOT IN (SELECT digest FROM snapshot_previews UNION SELECT digest FROM workspace_captures)')
+            db.execute('DELETE FROM archive_chunks WHERE digest NOT IN (SELECT digest FROM archive_refs)')
             return snapshot_id
 
     def history(self) -> list[dict[str, Any]]:
@@ -180,9 +220,54 @@ class SnapshotManager:
                 raise ValueError('Invalid image source')
             return bytes(row['data']) if row else None
 
+    def log_recovery_steps(self, snapshot_id: int, transaction: str, window: int, steps: list[tuple[str, str]]) -> None:
+        with self.connect() as db:
+            for step, status in steps:
+                db.execute('INSERT INTO recovery_steps VALUES(?,?,?,?,?,?) ON CONFLICT(transaction_id,window_index,step_id) DO UPDATE SET status=excluded.status,updated=excluded.updated', (transaction, snapshot_id, window, step, status, time.time()))
+
+    def recovery_log(self, snapshot_id: int) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            return [dict(row) for row in db.execute('SELECT transaction_id,window_index,step_id,status,updated FROM recovery_steps WHERE snapshot_id=? ORDER BY updated,window_index,step_id', (snapshot_id,))]
+
     def run_state(self, snapshot_id: int, transaction: str, state: str, result: list[dict[str, Any]]) -> None:
         with self.connect() as db:
             db.execute("INSERT INTO runs VALUES(?,?,?,?,?) ON CONFLICT(snapshot_id) DO UPDATE SET transaction_id=excluded.transaction_id,state=excluded.state,updated=excluded.updated,result=excluded.result", (snapshot_id, transaction, state, time.time(), canonical(result)))
+
+    def archives(self, snapshot_id: int) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            return [dict(r) for r in db.execute('SELECT r.window_index,r.tab_index,r.pane_index,SUM(c.raw_size) AS bytes,COUNT(*) AS chunks FROM archive_refs r JOIN archive_chunks c ON c.digest=r.digest WHERE r.snapshot_id=? GROUP BY r.window_index,r.tab_index,r.pane_index ORDER BY r.window_index,r.tab_index,r.pane_index', (snapshot_id,))]
+
+    def archive_text(self, snapshot_id: int, window: int, tab: int, pane: int, limit: int = 128 * 1024**2) -> bytes:
+        with self.connect() as db:
+            manifest = db.execute('SELECT parts,raw_size,digest FROM archive_manifests WHERE snapshot_id=? AND window_index=? AND tab_index=? AND pane_index=?', (snapshot_id, window, tab, pane)).fetchone()
+            rows = db.execute('SELECT r.part,c.digest,c.raw_size,length(c.data) AS stored_size FROM archive_refs r JOIN archive_chunks c ON c.digest=r.digest WHERE r.snapshot_id=? AND r.window_index=? AND r.tab_index=? AND r.pane_index=? ORDER BY r.part', (snapshot_id, window, tab, pane)).fetchall()
+        if not manifest: raise LookupError('Terminal archive not found')
+        if manifest['parts'] > (limit // 262144 + 1) or len(rows) != manifest['parts'] or manifest['raw_size'] < 0 or manifest['raw_size'] > limit: raise ValueError('Terminal archive is incomplete or oversized')
+        output = bytearray()
+        for number, row in enumerate(rows):
+            size = row['raw_size']
+            if row['part'] != number or not 0 <= size <= 262144 or not 0 <= row['stored_size'] <= 263000 or len(output) + size > limit:
+                raise ValueError('Invalid or oversized terminal archive')
+            try:
+                with self.connect() as db:
+                    chunk = db.execute('SELECT data FROM archive_chunks WHERE digest=?', (row['digest'],)).fetchone()
+                if not chunk or len(chunk['data']) != row['stored_size']: raise ValueError('Terminal archive is incomplete')
+                decoder = zlib.decompressobj()
+                raw = decoder.decompress(chunk['data'], size + 1)
+                if not decoder.eof or decoder.unused_data or len(raw) != size or hashlib.sha256(raw).hexdigest() != row['digest']:
+                    raise ValueError('Terminal archive integrity check failed')
+            except zlib.error as exc:
+                raise ValueError('Terminal archive is corrupt') from exc
+            output.extend(raw)
+        if len(output) != manifest['raw_size'] or hashlib.sha256(output).hexdigest() != manifest['digest']:
+            raise ValueError('Terminal archive integrity check failed')
+        return bytes(output)
+
+    def purge_archives(self) -> None:
+        with lock(self.path.with_suffix('.lock')), self.connect() as db:
+            db.execute('DELETE FROM archive_refs')
+            db.execute('DELETE FROM archive_manifests')
+            db.execute('DELETE FROM archive_chunks')
 
     def set_pinned(self, snapshot_id: int, pinned: bool) -> None:
         with lock(self.path.with_suffix('.lock')), self.connect() as db:
@@ -194,6 +279,7 @@ class SnapshotManager:
             if not db.execute('DELETE FROM snapshots WHERE id=?', (snapshot_id,)).rowcount:
                 raise LookupError('Snapshot not found')
             db.execute('DELETE FROM runs WHERE snapshot_id=?', (snapshot_id,))
+            db.execute('DELETE FROM archive_chunks WHERE digest NOT IN (SELECT digest FROM archive_refs)')
             db.execute('DELETE FROM preview_images WHERE digest NOT IN (SELECT digest FROM snapshot_previews UNION SELECT digest FROM workspace_captures)')
 
     def storage_bytes(self) -> int:
@@ -247,12 +333,15 @@ def config() -> dict[str, Any]:
 
 
 def update_config(changes: dict[str, Any]) -> None:
-    allowed = {'capture_previews', 'snapshot_retention', 'interval_seconds'}
+    allowed = {'capture_previews', 'snapshot_retention', 'interval_seconds', 'kitty_enabled', 'kitty_scrollback', 'kitty_socket', 'kitty_scrollback_limit', 'kitty_archive_total_limit', 'kitty_exclude_panels', 'kitty_exclude_text'}
     if set(changes) - allowed:
         raise ValueError('Unknown setting')
-    if 'capture_previews' in changes and not isinstance(changes['capture_previews'], bool):
-        raise ValueError('Invalid capture setting')
-    for key, low, high in [('snapshot_retention', 1, 500), ('interval_seconds', 10, 3600)]:
+    for key in ('capture_previews', 'kitty_enabled', 'kitty_scrollback'):
+        if key in changes and not isinstance(changes[key], bool): raise ValueError('Invalid ' + key)
+    if 'kitty_socket' in changes and (not isinstance(changes['kitty_socket'], str) or len(changes['kitty_socket']) > 4096): raise ValueError('Invalid socket')
+    for key in ('kitty_exclude_panels', 'kitty_exclude_text'):
+        if key in changes and (not isinstance(changes[key], list) or len(changes[key]) > 100): raise ValueError('Invalid ' + key)
+    for key, low, high in [('snapshot_retention', 1, 500), ('interval_seconds', 10, 3600), ('kitty_scrollback_limit', 1024, 128 * 1024**2), ('kitty_archive_total_limit', 1024, 4 * 1024**3)]:
         if key in changes and (type(changes[key]) is not int or not low <= changes[key] <= high):
             raise ValueError('Invalid ' + key)
     directory = xdg('CONFIG')
@@ -342,6 +431,8 @@ def shell_cwd(kitty_pid: Any) -> str | None:
 class Collector:
     def __init__(self, backend: HyprlandBackend, settings: dict[str, Any] | None = None):
         self.backend, self.settings = backend, settings if settings is not None else config()
+        self.archives: list[dict[str, Any]] = []
+        self.adapter_warnings: list[str] = []
 
     def collect(self) -> dict[str, Any]:
         clients = self.backend.query('clients')
@@ -361,7 +452,31 @@ class Collector:
                 cwd = shell_cwd(c.get('pid')) if kitty_pids.count(c.get('pid')) == 1 else None
                 if cwd: w.update(cwd=cwd, cwd_source='single_local_shell')
             windows.append(w)
+        self.archives = []
+        self.adapter_warnings = []
+        if self.settings.get('kitty_enabled', False):
+            from .adapters import builtin_adapters
+            adapter = builtin_adapters(self.settings).get('kitty')
+            candidates = [c for c in clients if str(c.get('class', '')).casefold() == 'kitty' and c.get('mapped', True)]
+            matching = [w for w in windows if str(w.get('class', '')).casefold() == 'kitty']
+            if len(candidates) == 1 and len(matching) == 1 and adapter:
+                pid = candidates[0].get('pid')
+                if type(pid) is int and pid > 0:
+                    result, captured = adapter.collect(bool(self.settings.get('kitty_scrollback', False)), expected_pid=pid)
+                    self.adapter_warnings.extend(result.warnings)
+                    if result.data:
+                        matching[0]['adapters'] = {'kitty': adapter.serialize(result.data)}
+                        matching[0]['adapter_status'] = result.status.value
+                else: captured = []
+            else:
+                captured = []
+                self.adapter_warnings.append('Detailed Kitty collection requires one unambiguous Kitty OS window')
+        else:
+            captured = []
         windows.sort(key=canonical)
+        if captured and len(matching) == 1:
+            index = windows.index(matching[0])
+            self.archives = [dict(a, window=index) for a in captured]
         return {'schema': SCHEMA, 'windows': windows, 'monitors': [{k: m.get(k) for k in ('name', 'x', 'y', 'width', 'height', 'scale', 'transform')} for m in sorted(monitors, key=lambda item: str(item.get('name', '')))], 'workspaces': [{'id': w.get('id'), 'name': w.get('name'), 'monitor': w.get('monitor')} for w in sorted(workspaces, key=lambda item: str(item.get('id', '')))]}
 
 
@@ -440,6 +555,20 @@ class DesktopRegistry:
             except (OSError, configparser.Error, KeyError, ValueError):
                 continue
         return None
+
+    def launch_kitty_session(self, entry: Path, session: str) -> bool:
+        binary = Path('/usr/bin/kitty')
+        try:
+            st = binary.stat()
+            if not self.allowed(entry) or st.st_uid != 0 or st.st_mode & 0o022 or len(session.encode()) > 262144:
+                return False
+            # Prepare input before spawning; no ambiguous partial write after launch.
+            with tempfile.TemporaryFile() as source:
+                source.write(session.encode('utf-8')); source.seek(0)
+                subprocess.Popen([str(binary), '--session', '-'], stdin=source, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            return True
+        except OSError:
+            return False
 
     def launch_kitty(self, entry: Path, cwd: str) -> bool:
         binary = Path('/usr/bin/kitty')
