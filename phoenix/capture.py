@@ -43,7 +43,7 @@ def capture_previews(backend: HyprlandBackend, settings: dict[str, Any]) -> list
             continue
         try:
             raw = subprocess.run(['grim', '-o', name, '-'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=8, check=True).stdout
-            image = subprocess.run(['magick', 'png:-', '-resize', '960x540>', '-strip', '-quality', '55', 'jpeg:-'], input=raw, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10, check=True).stdout
+            image = subprocess.run(['magick', 'png:-', '-resize', '1920x1920>', '-strip', '-sampling-factor', '4:4:4', '-quality', '88', 'jpeg:-'], input=raw, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10, check=True).stdout
             if not image.startswith(b'\xff\xd8') or not session_unlocked():
                 continue
             current = next((m for m in backend.query('monitors') if m.get('name') == name), {})

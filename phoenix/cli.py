@@ -11,7 +11,7 @@ import sys
 import threading
 import time
 from .adapters import builtin_adapters
-from .capture import capture_previews
+from .capture import capture_previews, session_unlocked
 from .core import Collector, DesktopRegistry, HyprlandBackend, SnapshotManager, config, is_locked, lock, trust_desktop, xdg, xdg_path
 from .recovery import RecoveryExecutor
 from .session import decided, decide
@@ -76,7 +76,9 @@ def daemon(manager: SnapshotManager, backend: HyprlandBackend) -> int:
                     collector = Collector(backend)
                     state = collector.collect()
                     if state['windows']:
-                        manager.save(state, automatic=True, previews=capture_previews(backend, config()), archives=collector.archives)
+                        settings = config()
+                        images = capture_previews(backend, settings)
+                        manager.save(state, automatic=True, previews=images, archives=collector.archives, include_workspace_captures=bool(settings.get('capture_previews', True) and session_unlocked()))
                         for warning in manager.last_archive_warnings: logging.warning('%s', warning)
                     manager.backup_if_due()
                 else:
@@ -106,7 +108,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == 'snapshot':
             collector = Collector(backend); state = collector.collect()
             if not state['windows']: raise RuntimeError('Refusing to save an empty snapshot')
-            print(manager.save(state, name=args.name, previews=capture_previews(backend, config()), archives=collector.archives))
+            settings = config(); images = capture_previews(backend, settings)
+            print(manager.save(state, name=args.name, previews=images, archives=collector.archives, include_workspace_captures=bool(settings.get('capture_previews', True) and session_unlocked())))
             for warning in collector.adapter_warnings + manager.last_archive_warnings: print('phoenix:', warning, file=sys.stderr)
         elif args.command == 'history': dump(manager.history())
         elif args.command == 'inspect':

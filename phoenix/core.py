@@ -204,7 +204,7 @@ class SnapshotManager:
         db.execute("PRAGMA busy_timeout=15000")
         return db
 
-    def save(self, state: dict[str, Any], name: str | None = None, automatic: bool = False, previews: list[dict[str, Any]] | None = None, archives: list[dict[str, Any]] | None = None) -> int:
+    def save(self, state: dict[str, Any], name: str | None = None, automatic: bool = False, previews: list[dict[str, Any]] | None = None, archives: list[dict[str, Any]] | None = None, include_workspace_captures: bool = False) -> int:
         state = copy.deepcopy(state)
         previews = previews or []
         archives = archives or []
@@ -234,6 +234,15 @@ class SnapshotManager:
         images = [(p, hashlib.sha256(p['data']).hexdigest()) for p in previews]
         with lock(self.path.with_suffix('.lock')), self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            if include_workspace_captures:
+                workspace_ids = {w.get('workspace') for w in state.get('windows', []) if type(w.get('workspace')) is int and w['workspace'] > 0}
+                workspace_ids.update(w.get('id') for w in state.get('workspaces', []) if type(w.get('id')) is int and w['id'] > 0)
+                present = {p['workspace'] for p, _ in images}
+                rows = db.execute('SELECT c.workspace,c.monitor,c.captured,c.digest,i.data FROM workspace_captures c JOIN preview_images i ON i.digest=c.digest WHERE c.captured <= ? ORDER BY c.captured DESC,c.id DESC', (now,))
+                for row in rows:
+                    if row['workspace'] in workspace_ids and row['workspace'] not in present:
+                        images.append((dict(row), row['digest']))
+                        present.add(row['workspace'])
             last = db.execute("SELECT id,digest FROM snapshots WHERE automatic=1 ORDER BY id DESC LIMIT 1").fetchone() if automatic else None
             old_images = [(r['workspace'], r['monitor'], r['digest']) for r in db.execute('SELECT workspace, monitor, digest FROM snapshot_previews WHERE snapshot_id=? ORDER BY workspace,monitor', (last['id'],))] if last else []
             new_images = sorted((p['workspace'], p['monitor'], image_digest) for p, image_digest in images)
@@ -347,6 +356,9 @@ class SnapshotManager:
             db.execute('BEGIN IMMEDIATE')
             for preview in previews:
                 digest = hashlib.sha256(preview['data']).hexdigest()
+                last = db.execute('SELECT digest FROM workspace_captures WHERE workspace=? AND monitor=? ORDER BY id DESC LIMIT 1', (preview['workspace'], preview['monitor'])).fetchone()
+                if last and last['digest'] == digest:
+                    continue
                 db.execute('INSERT OR IGNORE INTO preview_images VALUES(?,?)', (digest, preview['data']))
                 db.execute('INSERT INTO workspace_captures(workspace, monitor, captured, digest) VALUES(?,?,?,?)', (preview['workspace'], preview['monitor'], preview['captured'], digest))
             db.execute('DELETE FROM workspace_captures WHERE id NOT IN (SELECT id FROM workspace_captures ORDER BY id DESC LIMIT 240)')
@@ -360,6 +372,14 @@ class SnapshotManager:
                 key = (row['workspace'], row['monitor'])
                 if key not in latest:
                     latest[key] = dict(row)
+            return list(latest.values())
+
+    def live_workspace_captures(self, after: float) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute("SELECT id,workspace,monitor,captured,'event' AS source FROM workspace_captures WHERE captured > ? AND captured <= ? ORDER BY captured DESC,id DESC", (after, time.time()))
+            latest: dict[int, dict[str, Any]] = {}
+            for row in rows:
+                latest.setdefault(row['workspace'], dict(row))
             return list(latest.values())
 
     def capture_image(self, capture_id: int, source: str = 'event', workspace: int | None = None, monitor: str | None = None) -> bytes | None:

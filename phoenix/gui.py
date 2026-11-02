@@ -6,7 +6,7 @@ import gi
 gi.require_version('Gtk', '4.0')
 from gi.repository import Gtk, GLib
 from .adapters import builtin_adapters
-from .capture import capture_previews
+from .capture import capture_previews, session_unlocked
 from .carousel import Carousel
 from .core import Collector, DesktopRegistry, HyprlandBackend, SnapshotManager, config, update_config
 from .recovery import RecoveryExecutor, RecoveryPlanner
@@ -48,6 +48,14 @@ def run(manager: SnapshotManager, backend: HyprlandBackend, prompt: bool = False
             selected = dropdown.get_selected()
             if selected >= len(rows): raise LookupError('Снимок не выбран')
             return manager.get(rows[selected]['id'])
+        last_carousel_key: list[Any] = [None]
+        def update_carousel(row: dict[str, Any], state: dict[str, Any]) -> None:
+            live = manager.live_workspace_captures(row['created']) if rows and row['id'] == rows[0]['id'] and config().get('capture_previews', True) else []
+            key = (row['id'], tuple((p['id'], p['workspace'], p['monitor']) for p in live))
+            if key == last_carousel_key[0] and carousel.snapshot_id == row['id']:
+                return
+            last_carousel_key[0] = key
+            carousel.select_snapshot(row['id'], state, row['created'], live)
         def refresh(*_args: Any) -> None:
             child = checks.get_first_child()
             while child:
@@ -57,7 +65,7 @@ def run(manager: SnapshotManager, backend: HyprlandBackend, prompt: bool = False
                 carousel.reload(); carousel.timeline.items.clear(); carousel.timeline.index = None; carousel.area.queue_draw()
             try:
                 row, state = current()
-                carousel.select_snapshot(row['id'], state, row['created'])
+                update_carousel(row, state)
                 for wi, w in enumerate(state['windows']):
                     cb = Gtk.CheckButton(label=f"{w.get('class', '?')}  ·  рабочий стол {w.get('workspace', '?')}")
                     cb.set_active(True); checks.append(cb); checkboxes.append(cb)
@@ -76,7 +84,32 @@ def run(manager: SnapshotManager, backend: HyprlandBackend, prompt: bool = False
                 pin.set_label('Открепить' if row['pinned'] else 'Закрепить')
                 output.set_text(f"Выбран снимок #{row['id']}. Листайте рабочие столы этого снимка.")
             except Exception as exc: output.set_text(str(exc))
-        dropdown.connect('notify::selected', refresh); refresh()
+        selection_handler = dropdown.connect('notify::selected', refresh); refresh()
+        def poll_history() -> bool:
+            if not window.get_visible():
+                return True
+            try:
+                old_index = dropdown.get_selected()
+                old_id = rows[old_index]['id'] if old_index < len(rows) else None
+                new_rows = manager.history()
+                if [(r['id'], r['name'], r['pinned']) for r in new_rows] != [(r['id'], r['name'], r['pinned']) for r in rows]:
+                    follow = old_index == 0 and all(cb.get_active() for cb in checkboxes) and all(cb.get_active() for group in pane_checks.values() for cb in group.values())
+                    rows[:] = new_rows
+                    selected = 0 if follow else next((i for i, r in enumerate(rows) if r['id'] == old_id), 0)
+                    dropdown.handler_block(selection_handler)
+                    dropdown.set_model(Gtk.StringList.new(names() or ['Снимков нет']))
+                    dropdown.set_selected(selected)
+                    dropdown.handler_unblock(selection_handler)
+                    if not rows or rows[selected]['id'] != old_id:
+                        refresh()
+                if rows:
+                    row, state = current()
+                    update_carousel(row, state)
+            except Exception:
+                pass
+            return True
+        poll_source = GLib.timeout_add_seconds(1, poll_history)
+        window.connect('destroy', lambda *_: GLib.source_remove(poll_source))
         def background(fn: Any, after: Any = None) -> None:
             for b in (preview, snapshot, restore): b.set_sensitive(False)
             def work() -> None:
@@ -128,9 +161,9 @@ def run(manager: SnapshotManager, backend: HyprlandBackend, prompt: bool = False
                 time.sleep(0.5)
                 collector = Collector(backend); state = collector.collect()
                 if not state['windows']: raise ValueError('Пустой снимок не сохранён')
-                images = capture_previews(backend, config())
-                number = manager.save(state, previews=images, archives=collector.archives)
-                return f'Создан снимок #{number}, изображений: {len(images)}, архивов: {len(manager.archives(number))}. ' + '; '.join(collector.adapter_warnings + manager.last_archive_warnings)
+                settings = config(); images = capture_previews(backend, settings)
+                number = manager.save(state, previews=images, archives=collector.archives, include_workspace_captures=bool(settings.get('capture_previews', True) and session_unlocked()))
+                return f'Создан снимок #{number}, изображений: {len(manager.previews(number))}, архивов: {len(manager.archives(number))}. ' + '; '.join(collector.adapter_warnings + manager.last_archive_warnings)
             def finished() -> None:
                 rows[:] = manager.history()
                 dropdown.set_model(Gtk.StringList.new(names() or ['Снимков нет']))

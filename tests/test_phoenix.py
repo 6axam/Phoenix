@@ -255,6 +255,24 @@ def test_workspace_capture_retention_and_history(tmp_path):
         assert db.execute('SELECT COUNT(*) FROM preview_images WHERE digest NOT IN (SELECT digest FROM snapshot_previews UNION SELECT digest FROM workspace_captures)').fetchone()[0] == 0
 
 
+def test_snapshot_preserves_latest_workspace_captures_after_event_rotation(tmp_path):
+    m = SnapshotManager(tmp_path / 'db')
+    m.record_workspace_captures([
+        {'workspace': 2, 'monitor': 'A', 'captured': 10., 'data': b'old'},
+        {'workspace': 2, 'monitor': 'A', 'captured': 20., 'data': b'new'},
+        {'workspace': 3, 'monitor': 'A', 'captured': 30., 'data': b'visible-old'},
+        {'workspace': 4, 'monitor': 'A', 'captured': 30., 'data': b'unrelated'},
+        {'workspace': 2, 'monitor': 'A', 'captured': 9999999999., 'data': b'future'},
+    ])
+    saved = m.save(state(window(workspace=2), window(workspace=3)), previews=[{'workspace': 3, 'monitor': 'A', 'captured': 40., 'data': b'visible'}], include_workspace_captures=True)
+    assert {p['workspace']: p['data'] for p in m.previews(saved)} == {2: b'new', 3: b'visible'}
+    for i in range(241):
+        m.record_workspace_captures([{'workspace': 5, 'monitor': 'A', 'captured': 100. + i, 'data': str(i).encode()}])
+    assert {p['workspace']: p['data'] for p in m.previews(saved)} == {2: b'new', 3: b'visible'}
+    without = m.save(state(window(workspace=2)))
+    assert m.previews(without) == []
+
+
 def test_earlier_capture_is_explicit_and_exact_takes_priority():
     from phoenix.timeline import workspace_items
     s = state(window(workspace=1))
@@ -264,6 +282,24 @@ def test_earlier_capture_is_explicit_and_exact_takes_priority():
     exact = [{'workspace': 1, 'monitor': 'A', 'captured': 20.0}]
     item = workspace_items(12, s, exact, earlier)[0]
     assert item['has_image'] and not item['is_earlier'] and item['capture_id'] is None
+
+
+def test_live_capture_is_explicit_and_does_not_change_historical_snapshot(tmp_path):
+    from phoenix.timeline import workspace_items
+    m = SnapshotManager(tmp_path / 'db')
+    s = state(window(workspace=2))
+    saved = m.save(s, previews=[{'workspace': 2, 'monitor': 'A', 'captured': 10., 'data': b'saved'}])
+    import time
+    now = time.time()
+    m.record_workspace_captures([{'workspace': 2, 'monitor': 'A', 'captured': now, 'data': b'live'}])
+    assert m.live_workspace_captures(now + 1) == []
+    live = m.live_workspace_captures(now - 1)
+    item = workspace_items(saved, s, m.previews(saved), live=live)[0]
+    assert item['is_live'] and item['capture_id'] == live[0]['id']
+    assert m.capture_image(item['capture_id']) == b'live'
+    historical = workspace_items(saved, s, m.previews(saved))[0]
+    assert not historical['is_live'] and historical['capture_id'] is None
+    assert m.previews(saved)[0]['data'] == b'saved'
 
 
 def test_workspace_event_watcher(tmp_path):
@@ -283,6 +319,24 @@ def test_workspace_event_watcher(tmp_path):
     try:
         conn.sendall(b'activewindow>>private,do not log\nworkspacev2>>2,2\n')
         assert seen.wait(2) and len(captures) == 1
+    finally:
+        stop.set(); conn.close(); listener.close(); worker.join(2)
+    assert not worker.is_alive()
+
+
+def test_workspace_watcher_refreshes_without_a_switch(tmp_path):
+    import socket
+    import threading
+    from phoenix.watch import watch_workspace_events
+    path = tmp_path / 'socket'
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(path)); listener.listen(1); listener.settimeout(3)
+    stop, seen = threading.Event(), threading.Event()
+    worker = threading.Thread(target=watch_workspace_events, args=(stop, seen.set), kwargs={'path': path, 'refresh_interval': .05})
+    worker.start()
+    conn, _ = listener.accept()
+    try:
+        assert seen.wait(2)
     finally:
         stop.set(); conn.close(); listener.close(); worker.join(2)
     assert not worker.is_alive()

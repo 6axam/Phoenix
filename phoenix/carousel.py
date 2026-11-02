@@ -55,13 +55,17 @@ class Carousel(Gtk.Box):
         self.area.add_controller(motion)
         self.update_caption()
 
-    def select_snapshot(self, snapshot_id: int, state: dict[str, Any], created: float | None = None) -> None:
-        if self.snapshot_id != snapshot_id:
+    def select_snapshot(self, snapshot_id: int, state: dict[str, Any], created: float | None = None, live: list[dict[str, Any]] | None = None) -> None:
+        items = workspace_items(snapshot_id, state, self.manager.previews(snapshot_id), self.manager.earlier_workspace_captures(created) if created is not None else [], live)
+        if self.snapshot_id != snapshot_id or self.timeline.items != items:
+            previous_workspace = self.timeline.current['workspace'] if self.snapshot_id == snapshot_id and self.timeline.current else None
             self.snapshot_id = snapshot_id
-            self.timeline = Timeline(workspace_items(snapshot_id, state, self.manager.previews(snapshot_id), self.manager.earlier_workspace_captures(created) if created is not None else []))
+            self.timeline = Timeline(items)
+            if previous_workspace is not None:
+                self.timeline.index = next((i for i, item in enumerate(items) if item['workspace'] == previous_workspace), self.timeline.index)
             self.generation += 1
             self.cache.clear(); self.pending.clear()
-            self.position = 0.0; self.hovered = None; self.hover_levels.clear()
+            self.position = float(self.timeline.index or 0); self.hovered = None; self.hover_levels.clear()
             self.transition_start = None; self.transition_from = 0.0
             self.preload_neighbors()
         self.update_caption(); self.area.queue_draw()
@@ -154,7 +158,7 @@ class Carousel(Gtk.Box):
             self.caption.set_text('В этом снимке нет рабочих столов.')
             return
         if item['captured'] is not None:
-            detail = ('Более ранний кадр: ' if item['is_earlier'] else 'Кадр снимка: ') + datetime.fromtimestamp(item['captured']).strftime('%d.%m.%Y %H:%M:%S')
+            detail = ('Новый кадр (после снимка): ' if item.get('is_live') else 'Более ранний кадр: ' if item['is_earlier'] else 'Кадр от: ') + datetime.fromtimestamp(item['captured']).strftime('%d.%m.%Y %H:%M:%S')
         else:
             detail = 'Схема окон — изображение не было сохранено'
         apps = ', '.join(str(w.get('class', '?')) for w in item['windows']) or 'Нет окон'
