@@ -56,6 +56,20 @@ def neighbors(tab):
     return [{direction:sorted(ids[n] for n in entries if n in ids) for direction,entries in w.get('neighbors',{}).items()} for w in windows]
 
 
+def test_real_save_as_session_export_is_not_executed(kitty_factory, tmp_path):
+    source, path = kitty_factory('export-source', 'new_tab Export\nlayout splits\nlaunch\nlaunch --location=vsplit\nlaunch --location=hsplit\n')
+    target = tmp_path / 'export.kitty-session'
+    subprocess.run(['kitten', '@', '--to', 'unix:' + path, 'action', 'save_as_session', f'--save-only {target}'], check=True, timeout=5, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = time.monotonic() + 5
+    while not target.exists() and time.monotonic() < deadline:
+        time.sleep(.05)
+    assert target.is_file() and target.stat().st_size < 1024 * 1024
+    exported = target.read_text()
+    assert 'layout splits' in exported
+    assert sum(line.startswith('launch') for line in exported.splitlines()) == 3
+    assert source.poll() is None
+
+
 @pytest.mark.parametrize('layout',['horizontal','vertical','splits'])
 def test_real_layout_restore(kitty_factory,layout):
     extra='launch --location=vsplit\nlaunch --location=hsplit\n' if layout=='splits' else 'launch\nlaunch\n'

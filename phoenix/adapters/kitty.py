@@ -20,6 +20,26 @@ MAX_TABS = 32
 MAX_PANE = 128 * 1024 * 1024
 MAX_CAPTURE_BATCH = 64 * 1024 * 1024
 LAYOUTS = {'tall', 'fat', 'grid', 'horizontal', 'vertical', 'splits', 'stack'}
+PROCESS_KINDS = {'shell', 'codex', 'tmux', 'ssh', 'monitor', 'editor', 'other', 'unknown'}
+PROCESS_NAMES = {
+    'bash': 'shell', 'zsh': 'shell', 'fish': 'shell', 'sh': 'shell', 'dash': 'shell',
+    'codex': 'codex', 'tmux': 'tmux', 'ssh': 'ssh',
+    'btop': 'monitor', 'htop': 'monitor', 'top': 'monitor',
+    'vim': 'editor', 'nvim': 'editor', 'vi': 'editor', 'nano': 'editor',
+}
+
+
+def foreground_kind(processes: Any) -> str:
+    """Only persist a coarse hint; it is never proof of identity or permission to run."""
+    if not isinstance(processes, list) or not processes:
+        return 'unknown'
+    if len(processes) != 1 or not isinstance(processes[0], dict):
+        return 'other'
+    cmdline = processes[0].get('cmdline')
+    if not isinstance(cmdline, list) or not cmdline or not isinstance(cmdline[0], str):
+        return 'other'
+    name = os.path.basename(cmdline[0]).lstrip('-')
+    return PROCESS_NAMES.get(name, 'other')
 
 
 class KittyError(RuntimeError):
@@ -171,7 +191,7 @@ class KittyAdapter:
                     cwd = pane.get('cwd')
                     # Never persist command lines, environment, titles, or remote host data.
                     foreground = pane.get('foreground_processes') or []
-                    data = {'cwd': cwd if isinstance(cwd, str) and cwd.startswith('/') and len(cwd) <= 4096 else None, 'process': 'other' if foreground else 'unknown', 'scrollback_capture': 'disabled' if not collect_text else 'unavailable'}
+                    data = {'cwd': cwd if isinstance(cwd, str) and cwd.startswith('/') and len(cwd) <= 4096 else None, 'process': foreground_kind(foreground), 'scrollback_capture': 'disabled' if not collect_text else 'unavailable'}
                     entry['panes'].append(data)
                     pid = pane.get('id')
                     if collect_text and isinstance(pid, int) and pid in excluded:
@@ -217,7 +237,7 @@ class KittyAdapter:
             count += len(tab['panes'])
             if type(tab.get('active_pane')) is not int or not 0 <= tab['active_pane'] < len(tab['panes']): return False
             for pane in tab['panes']:
-                if not isinstance(pane, dict) or pane.get('process') not in ('other', 'unknown'): return False
+                if not isinstance(pane, dict) or not isinstance(pane.get('process'), str) or pane['process'] not in PROCESS_KINDS: return False
                 cwd = pane.get('cwd')
                 if cwd is not None and (not isinstance(cwd, str) or len(cwd) > 4096 or not cwd.startswith('/')): return False
         return count <= MAX_PANELS
@@ -233,7 +253,8 @@ class KittyAdapter:
                 usable = isinstance(cwd, str) and '$' not in cwd and all(ord(c) >= 32 and ord(c) != 127 for c in cwd) and Path(cwd).is_dir()
                 steps.append(PlanStep(ident, 'shell pane and directory', [f'tab:{ti}'], status='available' if usable else 'partial', detail='' if usable else 'Working directory unavailable or unsafe; default directory will be used'))
                 steps.append(PlanStep(f'archive:{ti}:{pi}', 'view archived scrollback', status='unknown', detail='Stored separately; availability depends on the archive'))
-                steps.append(PlanStep(f'process:{ti}:{pi}', 'previous process', [ident], status='unavailable', requires_confirmation=True, detail='Automatic process execution is unsupported'))
+                kind = tab['panes'][pi].get('process', 'unknown')
+                steps.append(PlanStep(f'process:{ti}:{pi}', 'previous process', [ident], status='unavailable', requires_confirmation=True, detail=f'Observed process category: {kind}; identity unverified and automatic execution unsupported'))
         return steps
 
     def serialize(self, data: dict[str, Any]) -> dict[str, Any]:

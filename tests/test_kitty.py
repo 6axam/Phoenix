@@ -46,6 +46,19 @@ def test_registry_and_safe_collection(kitty_socket):
     assert len(calls) == 3 and any('content rule' in w for w in result.warnings)
 
 
+@pytest.mark.parametrize(('value','expected'), [
+    ([], 'unknown'), ([{'cmdline': ['/usr/bin/codex', '--token=secret']}], 'codex'),
+    ([{'cmdline': ['/usr/bin/ssh', 'secret-host']}], 'ssh'),
+    ([{'cmdline': ['btop']}], 'monitor'), ([{'cmdline': ['-zsh']}], 'shell'),
+    ([{'cmdline': ['unknown-secret']}], 'other'), ([{'cmdline': ['codex']}, {'cmdline': ['ssh']}], 'other'),
+    ([{'cmdline': 'codex'}], 'other'),
+])
+def test_foreground_kind_is_coarse_and_never_authorizes_execution(value, expected):
+    from phoenix.adapters.kitty import foreground_kind
+    assert foreground_kind(value) == expected
+    assert 'secret' not in foreground_kind(value)
+
+
 def test_kitty_unavailable_and_untrusted_socket(tmp_path, kitty_socket):
     assert KittyAdapter({}).availability().status.value == 'skipped'
     assert KittyAdapter({'kitty_enabled':True, 'kitty_socket':str(tmp_path/'missing')}).availability().status.value == 'unsupported'
@@ -64,6 +77,12 @@ def test_session_cannot_restore_commands_or_inject_syntax(kitty_socket, tmp_path
     assert any(s.requires_confirmation and s.status == 'unavailable' for s in steps)
     data['tabs'][0]['layout'] = 'splits\nlaunch evil'
     with pytest.raises(KittyError): adapter.session(data)
+
+
+def test_corrupt_process_kind_is_rejected(kitty_socket):
+    adapter = KittyAdapter({'kitty_socket': str(kitty_socket)})
+    data = {'version': 1, 'active_tab': 0, 'tabs': [{'layout': 'vertical', 'active_pane': 0, 'panes': [{'cwd': None, 'process': ['codex']}]}]}
+    assert not adapter.validate(data)
 
 
 def test_bounded_command_limits_and_timeout():
