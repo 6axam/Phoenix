@@ -14,6 +14,8 @@ import time
 from typing import Any
 from .base import AdapterResult, PlanStep, Status
 from .kitty_topology import derive_plan, valid_plan
+from .codex_binding import collect_binding
+from .codex_session import CodexCheckError, normalize_id
 
 MAX_JSON = 4 * 1024 * 1024
 MAX_PANELS = 64
@@ -196,6 +198,9 @@ class KittyAdapter:
                     # Never persist command lines, environment, titles, or remote host data.
                     foreground = pane.get('foreground_processes') or []
                     data = {'cwd': cwd if isinstance(cwd, str) and cwd.startswith('/') and len(cwd) <= 4096 else None, 'process': foreground_kind(foreground), 'scrollback_capture': 'disabled' if not collect_text else 'unavailable'}
+                    if self.settings.get('kitty_codex_bindings', False):
+                        binding = collect_binding(pane)
+                        if binding is not None: data['codex_session'] = binding
                     entry['panes'].append(data)
                     pid = pane.get('id')
                     if collect_text and isinstance(pid, int) and pid in excluded:
@@ -245,6 +250,12 @@ class KittyAdapter:
                 if not isinstance(pane, dict) or not isinstance(pane.get('process'), str) or pane['process'] not in PROCESS_KINDS: return False
                 cwd = pane.get('cwd')
                 if cwd is not None and (not isinstance(cwd, str) or len(cwd) > 4096 or not cwd.startswith('/')): return False
+                if 'codex_session' in pane:
+                    binding = pane['codex_session']
+                    if not isinstance(binding, dict) or set(binding) != {'session_id', 'source'} or binding['source'] != 'explicit_resume': return False
+                    try:
+                        if normalize_id(binding['session_id']) != binding['session_id']: return False
+                    except CodexCheckError: return False
         return count <= MAX_PANELS
 
     def plan(self, data: dict[str, Any]) -> list[PlanStep]:
@@ -261,6 +272,8 @@ class KittyAdapter:
                 steps.append(PlanStep(f'archive:{ti}:{pi}', 'view archived scrollback', status='unknown', detail='Stored separately; availability depends on the archive'))
                 kind = tab['panes'][pi].get('process', 'unknown')
                 steps.append(PlanStep(f'process:{ti}:{pi}', 'previous process', [ident], status='unavailable', requires_confirmation=True, detail=f'Observed process category: {kind}; identity unverified and automatic execution unsupported'))
+                if 'codex_session' in tab['panes'][pi]:
+                    steps.append(PlanStep(f'codex:{ti}:{pi}', 'Codex conversation', [ident], status='unavailable', requires_confirmation=True, detail='Explicitly bound ID saved; automatic resume is not implemented'))
         return steps
 
     def serialize(self, data: dict[str, Any]) -> dict[str, Any]:

@@ -86,7 +86,7 @@ class RecoveryPlanner:
                 chosen = components[item['index']]
                 for step in item['steps']:
                     bits = step['id'].split(':')
-                    if len(bits) == 3 and bits[0] in ('pane', 'process') and (int(bits[1]), int(bits[2])) not in chosen:
+                    if len(bits) == 3 and bits[0] in ('pane', 'process', 'codex') and (int(bits[1]), int(bits[2])) not in chosen:
                         step['status'] = 'skipped'
                     elif len(bits) == 2 and bits[0] == 'tab' and not any(tab == int(bits[1]) for tab, _ in chosen):
                         step['status'] = 'skipped'

@@ -40,6 +40,10 @@ def parser() -> argparse.ArgumentParser:
     trust = sub.add_parser('trust-desktop', help='Доверять конкретному desktop-файлу до его изменения'); trust.add_argument('path', help='Абсолютный путь к desktop-файлу')
     codex = sub.add_parser('codex-check', help='Проверить конкретный разговор Codex и каталог проекта')
     codex.add_argument('session_id', help='Полный UUID разговора'); codex.add_argument('--cwd', required=True, help='Абсолютный путь к проекту')
+    resume_codex = sub.add_parser('codex-resume', help='Открыть конкретную сессию Codex в текущей панели Kitty')
+    resume_codex.add_argument('session_id', help='Полный UUID разговора'); resume_codex.add_argument('--cwd', required=True, help='Абсолютный путь к проекту')
+    saved_codex = sub.add_parser('codex-restore', help='Продолжить Codex из сохранённой панели в текущем Kitty')
+    saved_codex.add_argument('snapshot'); saved_codex.add_argument('window', type=int); saved_codex.add_argument('tab', type=int); saved_codex.add_argument('pane', type=int)
     return p
 
 
@@ -99,6 +103,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == 'codex-check':
             from .adapters.codex_session import check_session
             dump(check_session(args.session_id, args.cwd)); return 0
+        if args.command == 'codex-resume':
+            from .adapters.codex_binding import resume_in_current_pane
+            return resume_in_current_pane(args.session_id, args.cwd)
+        if args.command == 'codex-restore':
+            from .adapters.codex_binding import resume_in_current_pane, saved_binding
+            manager = SnapshotManager(readonly=True)
+            _, state = manager.get(args.snapshot)
+            ident, cwd = saved_binding(state, args.window, args.tab, args.pane)
+            return resume_in_current_pane(ident, cwd)
         if args.command == 'config':
             dump({'path': str(xdg_path('CONFIG') / 'config.json'), 'settings': config()}); return 0
         readonly = args.command in ('status', 'history', 'inspect', 'doctor', 'recovery-log') or (args.command == 'restore' and args.dry_run) or (args.command == 'archive' and args.archive_command in ('list', 'show'))

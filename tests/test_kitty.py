@@ -46,6 +46,20 @@ def test_registry_and_safe_collection(kitty_socket):
     assert len(calls) == 3 and any('content rule' in w for w in result.warnings)
 
 
+def test_codex_binding_capture_requires_explicit_opt_in(kitty_socket, monkeypatch):
+    import phoenix.adapters.kitty as module
+    ident = 'a04f5046-8ea3-4c04-bda8-49fa089858c5'
+    calls = []
+    monkeypatch.setattr(module, 'collect_binding', lambda pane: calls.append(pane) or {'session_id': ident, 'source': 'explicit_resume'})
+    runner = lambda args, limit, timeout: json.dumps(payload()).encode()
+    base = {'kitty_enabled': True, 'kitty_socket': str(kitty_socket)}
+    off, _ = KittyAdapter(base, runner).collect()
+    assert not calls and 'codex_session' not in off.data['tabs'][0]['panes'][0]
+    on, _ = KittyAdapter(dict(base, kitty_codex_bindings=True), runner).collect()
+    assert calls and on.data['tabs'][0]['panes'][0]['codex_session']['session_id'] == ident
+    assert 'secret' not in canonical(on.data)
+
+
 @pytest.mark.parametrize(('value','expected'), [
     ([], 'unknown'), ([{'cmdline': ['/usr/bin/codex', '--token=secret']}], 'codex'),
     ([{'cmdline': ['/usr/bin/ssh', 'secret-host']}], 'ssh'),

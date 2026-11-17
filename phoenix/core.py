@@ -515,10 +515,10 @@ def config() -> dict[str, Any]:
 
 
 def update_config(changes: dict[str, Any]) -> None:
-    allowed = {'capture_previews', 'snapshot_retention', 'interval_seconds', 'kitty_enabled', 'kitty_scrollback', 'kitty_socket', 'kitty_sockets', 'kitty_scrollback_limit', 'kitty_archive_total_limit', 'kitty_exclude_panels', 'kitty_exclude_text'}
+    allowed = {'capture_previews', 'snapshot_retention', 'interval_seconds', 'kitty_enabled', 'kitty_scrollback', 'kitty_codex_bindings', 'kitty_socket', 'kitty_sockets', 'kitty_scrollback_limit', 'kitty_archive_total_limit', 'kitty_exclude_panels', 'kitty_exclude_text'}
     if set(changes) - allowed:
         raise ValueError('Unknown setting')
-    for key in ('capture_previews', 'kitty_enabled', 'kitty_scrollback'):
+    for key in ('capture_previews', 'kitty_enabled', 'kitty_scrollback', 'kitty_codex_bindings'):
         if key in changes and not isinstance(changes[key], bool): raise ValueError('Invalid ' + key)
     if 'kitty_socket' in changes and (not isinstance(changes['kitty_socket'], str) or len(changes['kitty_socket']) > 4096): raise ValueError('Invalid socket')
     if 'kitty_sockets' in changes and (not isinstance(changes['kitty_sockets'], list) or len(changes['kitty_sockets']) > 16 or any(not isinstance(p, str) or not p.startswith('/') or len(p) > 4096 for p in changes['kitty_sockets'])): raise ValueError('Invalid kitty_sockets')
