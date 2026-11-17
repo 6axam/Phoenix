@@ -102,3 +102,65 @@ def test_real_multiple_processes_and_ambiguous_same_process(kitty_factory):
     kitty=[w['adapters']['kitty'] for w in snapshot['windows'] if 'kitty' in w.get('adapters',{})]
     assert sorted(tuple(len(t['panes']) for t in k['tabs']) for k in kitty)==[(1,1),(2,)]
     assert any('ambiguous' in warning for warning in collector.adapter_warnings)
+
+
+@pytest.mark.parametrize('locations', [
+    ('vsplit',), ('hsplit',),
+    ('vsplit', 'hsplit'), ('hsplit', 'vsplit'),
+    ('vsplit', 'vsplit'), ('hsplit', 'hsplit'),
+])
+def test_real_small_split_topology_restored(kitty_factory, tmp_path, locations):
+    directories = [tmp_path / ('pane' + str(i)) for i in range(len(locations) + 1)]
+    for directory in directories: directory.mkdir()
+    session = 'new_tab Topology\nlayout splits\nlaunch --cwd=' + str(directories[0]) + '\n'
+    for i, location in enumerate(locations, 1):
+        session += f'launch --location={location} --cwd={directories[i]}\n'
+    source, path = kitty_factory('source-topology', session)
+    adapter = KittyAdapter({'kitty_enabled': True, 'kitty_socket': path})
+    result, _ = adapter.collect(expected_pid=source.pid)
+    assert result.data and 'topology' in result.data['tabs'][0]
+    restored, target = kitty_factory('target-topology', adapter.session(result.data))
+    def by_cwd(tab):
+        ws = tab['windows']; names = {w['id']: w['cwd'] for w in ws}
+        return {w['cwd']: {direction: sorted(names[n] for n in w.get('neighbors', {}).get(direction, [])) for direction in ('left', 'right', 'top', 'bottom')} for w in ws}
+    assert by_cwd(get_tab(path)) == by_cwd(get_tab(target))
+    assert restored.poll() is None
+
+
+def test_real_topology_preserves_active_panes_across_tabs(kitty_factory, tmp_path):
+    directories = [tmp_path / str(i) for i in range(6)]
+    for directory in directories: directory.mkdir()
+    session = ''
+    for offset in (0, 3):
+        session += (f'new_tab Tab{offset}\nlayout splits\nlaunch --cwd={directories[offset]}\nfocus\n'
+                    f'launch --location=vsplit --cwd={directories[offset+1]}\n'
+                    f'launch --location=hsplit --cwd={directories[offset+2]}\n')
+    session += 'focus_tab 0\n'
+    source, path = kitty_factory('source-tabs', session)
+    adapter = KittyAdapter({'kitty_enabled': True, 'kitty_socket': path})
+    result, _ = adapter.collect(expected_pid=source.pid)
+    assert result.data and all('topology' in tab for tab in result.data['tabs'])
+    restored, target = kitty_factory('restored-tabs', adapter.session(result.data))
+    re_collected, _ = KittyAdapter({'kitty_enabled': True, 'kitty_socket': target}).collect(expected_pid=restored.pid)
+    assert re_collected.data['active_tab'] == result.data['active_tab']
+    def active_cwds(data):
+        return [tab['panes'][tab['active_pane']]['cwd'] for tab in data['tabs']]
+    assert active_cwds(re_collected.data) == active_cwds(result.data)
+
+
+def test_real_resized_splits_preserve_neighbors_not_exact_proportions(kitty_factory, tmp_path):
+    dirs = [tmp_path / str(i) for i in range(3)]
+    for directory in dirs: directory.mkdir()
+    session = (f'new_tab Resized\nlayout splits\nlaunch --cwd={dirs[0]}\n'
+               f'launch --location=vsplit --bias=25 --cwd={dirs[1]}\n'
+               f'launch --location=hsplit --bias=35 --cwd={dirs[2]}\n')
+    source, path = kitty_factory('source-resized', session)
+    adapter = KittyAdapter({'kitty_enabled': True, 'kitty_socket': path})
+    result, _ = adapter.collect(expected_pid=source.pid)
+    assert result.data and 'topology' in result.data['tabs'][0]
+    _, target = kitty_factory('target-resized', adapter.session(result.data))
+    def edges(tab):
+        names = {w['id']: w['cwd'] for w in tab['windows']}
+        return {w['cwd']: {d: sorted(names[n] for n in w.get('neighbors', {}).get(d, [])) for d in ('left', 'right', 'top', 'bottom')} for w in tab['windows']}
+    assert edges(get_tab(path)) == edges(get_tab(target))
+    assert 'sizes may differ' in next(s.detail for s in adapter.plan(result.data) if s.id == 'tab:0')

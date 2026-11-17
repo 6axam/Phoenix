@@ -90,6 +90,11 @@ class RecoveryPlanner:
                         step['status'] = 'skipped'
                     elif len(bits) == 2 and bits[0] == 'tab' and not any(tab == int(bits[1]) for tab, _ in chosen):
                         step['status'] = 'skipped'
+                    elif len(bits) == 2 and bits[0] == 'tab' and item['action'] == 'launch' and data and adapter.validate(data):
+                        tab_index = int(bits[1]); tab = data['tabs'][tab_index]
+                        if 'topology' in tab and any((tab_index, pane) not in chosen for pane in range(len(tab['panes']))):
+                            step['status'] = 'partial'
+                            step['detail'] = 'Only selected panels will be opened; the original split arrangement will not be applied'
                 if not chosen:
                     item['action'] = 'skip'
                     for step in item['steps']:

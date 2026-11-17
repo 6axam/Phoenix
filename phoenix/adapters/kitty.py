@@ -13,6 +13,7 @@ import subprocess
 import time
 from typing import Any
 from .base import AdapterResult, PlanStep, Status
+from .kitty_topology import derive_plan, valid_plan
 
 MAX_JSON = 4 * 1024 * 1024
 MAX_PANELS = 64
@@ -185,6 +186,9 @@ class KittyAdapter:
                 if total > MAX_PANELS: raise KittyError('Too many Kitty panels')
                 layout = str(tab.get('layout', 'tall')).split(':', 1)[0]
                 entry: dict[str, Any] = {'layout': layout if layout in LAYOUTS else 'tall', 'active_pane': 0, 'panes': []}
+                if layout == 'splits':
+                    topology = derive_plan(windows)
+                    if topology is not None: entry['topology'] = topology
                 if tab.get('is_active'): out['active_tab'] = ti
                 for pi, pane in enumerate(windows):
                     if pane.get('is_active'): entry['active_pane'] = pi
@@ -233,7 +237,8 @@ class KittyAdapter:
         if type(active) is not int or not 0 <= active < len(data['tabs']): return False
         count = 0
         for tab in data['tabs']:
-            if not isinstance(tab, dict) or tab.get('layout') not in LAYOUTS or not isinstance(tab.get('panes'), list) or not tab['panes']: return False
+            if not isinstance(tab, dict) or not isinstance(tab.get('layout'), str) or tab['layout'] not in LAYOUTS or not isinstance(tab.get('panes'), list) or not tab['panes']: return False
+            if 'topology' in tab and (tab['layout'] != 'splits' or not valid_plan(tab['topology'], len(tab['panes']))): return False
             count += len(tab['panes'])
             if type(tab.get('active_pane')) is not int or not 0 <= tab['active_pane'] < len(tab['panes']): return False
             for pane in tab['panes']:
@@ -246,7 +251,8 @@ class KittyAdapter:
         if not self.validate(data): return [PlanStep('kitty', 'kitty', status='unavailable', detail='Invalid Kitty state')]
         steps = [PlanStep('workspace', 'workspace'), PlanStep('kitty', 'kitty OS window', ['workspace'])]
         for ti, tab in enumerate(data['tabs']):
-            steps.append(PlanStep(f'tab:{ti}', 'tab', ['kitty'], status='partial' if len(tab['panes']) > 1 else 'available', detail='Panel split tree and exact sizes are not documented in the session interface' if len(tab['panes']) > 1 else ''))
+            detail = ('Directional split arrangement will be reconstructed; divider sizes may differ' if 'topology' in tab else 'Panel split tree and exact sizes are not available') if len(tab['panes']) > 1 else ''
+            steps.append(PlanStep(f'tab:{ti}', 'tab', ['kitty'], status='partial' if len(tab['panes']) > 1 else 'available', detail=detail))
             for pi, _ in enumerate(tab['panes']):
                 ident = f'pane:{ti}:{pi}'
                 cwd = tab['panes'][pi].get('cwd')
@@ -284,7 +290,10 @@ class KittyAdapter:
                 continue
             if ti == data['active_tab']: active_tab = len(tabs)
             active_pane = next((i for i, (pi, _) in enumerate(included) if pi == tab['active_pane']), 0)
-            tabs.append({'layout': tab['layout'], 'active_pane': active_pane, 'panes': [dict(pane) for _, pane in included]})
+            item = {'layout': tab['layout'], 'active_pane': active_pane, 'panes': [dict(pane) for _, pane in included]}
+            if len(included) == len(tab['panes']) and 'topology' in tab:
+                item['topology'] = [dict(step) for step in tab['topology']]
+            tabs.append(item)
         return {'version': 1, 'tabs': tabs, 'active_tab': active_tab} if tabs else None
 
     def session(self, data: dict[str, Any]) -> str:
@@ -292,13 +301,22 @@ class KittyAdapter:
         lines = []
         for ti, tab in enumerate(data['tabs']):
             lines += [f'new_tab Terminal {ti + 1}', 'layout ' + tab['layout']]
-            for pi, pane in enumerate(tab['panes']):
+            order = tab.get('topology') or [{'pane': pi, 'parent': None, 'axis': None} for pi in range(len(tab['panes']))]
+            for step in order:
+                pi = step['pane']; pane = tab['panes'][pi]
+                if 'topology' in tab and step['parent'] is not None:
+                    lines.append(f"focus_matching_window var:phoenix_pane=^{ti}_{step['parent']}$")
+                options = []
+                if 'topology' in tab:
+                    options.append(f'--var=phoenix_pane={ti}_{pi}')
+                    if step['axis'] is not None: options.append('--location=' + step['axis'])
                 cwd = pane.get('cwd')
                 # Session files expand $ variables; skip paths with special expansion or controls.
                 if isinstance(cwd, str) and '$' not in cwd and all(ord(c) >= 32 and ord(c) != 127 for c in cwd) and Path(cwd).is_dir():
-                    lines.append('launch --cwd=' + shlex.quote(cwd))
-                else:
-                    lines.append('launch')
-                if pi == tab['active_pane']: lines.append('focus')
+                    options.append('--cwd=' + shlex.quote(cwd))
+                lines.append('launch' + (' ' + ' '.join(options) if options else ''))
+                if 'topology' not in tab and pi == tab['active_pane']: lines.append('focus')
+            if 'topology' in tab:
+                lines.append(f"focus_matching_window var:phoenix_pane=^{ti}_{tab['active_pane']}$")
         lines.append('focus_tab ' + str(data['active_tab']))
         return '\n'.join(lines) + '\n'
