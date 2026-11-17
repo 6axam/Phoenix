@@ -9,7 +9,7 @@ from .adapters import builtin_adapters
 from .capture import capture_previews, session_unlocked
 from .carousel import Carousel
 from .core import Collector, DesktopRegistry, HyprlandBackend, SnapshotManager, config, update_config
-from .recovery import RecoveryExecutor, RecoveryPlanner
+from .recovery import RecoveryExecutor
 from .session import decide
 
 
@@ -39,6 +39,7 @@ def run(manager: SnapshotManager, backend: HyprlandBackend, prompt: bool = False
         checkboxes: list[Any] = []
         pane_checks: dict[int, dict[tuple[int, int], Any]] = {}
         output = Gtk.Label(label='', xalign=0, wrap=True, selectable=True); root.append(output)
+        restore_history = Gtk.CheckButton(label='Показать сохранённый вывод в новых панелях Kitty'); root.append(restore_history)
         buttons = Gtk.Box(spacing=8); root.append(buttons)
         preview = Gtk.Button(label='План восстановления'); snapshot = Gtk.Button(label='Создать снимок'); restore = Gtk.Button(label='Восстановить'); skip = Gtk.Button(label='Пропустить'); settings = Gtk.Button(label='Настройки'); terminal_archive = Gtk.Button(label='Архив терминала'); pin = Gtk.Button(label='Закрепить'); delete = Gtk.Button(label='Удалить')
         restore.add_css_class('suggested-action')
@@ -132,8 +133,9 @@ def run(manager: SnapshotManager, backend: HyprlandBackend, prompt: bool = False
             except Exception as exc: output.set_text(str(exc)); return
             selected = {i for i, cb in enumerate(checkboxes) if cb.get_active()}
             components = {i: {key for key, cb in panes.items() if cb.get_active()} for i, panes in pane_checks.items()}
+            history_requested = restore_history.get_active()
             def work() -> str:
-                plan = RecoveryPlanner(DesktopRegistry(), manager).plan(state, backend.query('clients'), row['id'], selected, components)
+                plan = RecoveryExecutor(backend, DesktopRegistry(), manager).restore(row['id'], state, dry_run=True, selected=selected, components=components, restore_history=history_requested)
                 lines = []
                 for p in plan:
                     lines.append(f"{p['class']}: {p['action']}")
@@ -177,12 +179,13 @@ def run(manager: SnapshotManager, backend: HyprlandBackend, prompt: bool = False
         def do_restore(_button: Any) -> None:
             selected = {i for i, cb in enumerate(checkboxes) if cb.get_active()}
             components = {i: {key for key, cb in panes.items() if cb.get_active()} for i, panes in pane_checks.items()}
+            history_requested = restore_history.get_active()
             try: row, state = current()
             except Exception as exc: output.set_text(str(exc)); return
             def work() -> str:
-                result = RecoveryExecutor(backend, DesktopRegistry(), manager).restore(row['id'], state, selected=selected, components=components)
+                result = RecoveryExecutor(backend, DesktopRegistry(), manager).restore(row['id'], state, selected=selected, components=components, restore_history=history_requested)
                 decide('restore')
-                return '\n'.join(f"{r['class']}: {r['status']} — {r.get('detail', '')}" for r in result) or 'Компоненты не выбраны'
+                return '\n'.join(f"{r['class']}: {r['status']} — {r.get('detail', '')}" + (f" · показ истории запрошен в панелях: {r['terminal_history_requested']} (результат не проверен)" if r.get('terminal_history_requested') else '') for r in result) or 'Компоненты не выбраны'
             background(work)
         def do_skip(_button: Any) -> None:
             try: decide('skip'); window.close()

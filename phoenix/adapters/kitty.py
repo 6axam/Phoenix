@@ -10,6 +10,7 @@ import socket
 import stat
 import struct
 import subprocess
+import sys
 import time
 from typing import Any
 from .base import AdapterResult, PlanStep, Status
@@ -280,12 +281,13 @@ class KittyAdapter:
         if not self.validate(data): raise KittyError('Invalid Kitty state')
         return json.loads(json.dumps(data, ensure_ascii=False))
 
-    def execute(self, data: dict[str, Any], launch: Any) -> AdapterResult:
+    def execute(self, data: dict[str, Any], launch: Any, *, archive_refs: dict[tuple[int, int], tuple[int, int, int, int]] | None = None) -> AdapterResult:
         try:
-            session = self.session(data)
+            session = self.session(data, archive_refs=archive_refs)
             if not launch(session):
                 return AdapterResult(Status.FAILED, warnings=['Kitty session could not be launched'])
             warnings = ['Shells launched; previous programs and exact split geometry are not restored']
+            if archive_refs: warnings.append('Archived text will be shown in new panels; actual display is not verified')
             if any(pane.get('cwd') and ('$' in pane['cwd'] or not Path(pane['cwd']).is_dir() or any(ord(c) < 32 or ord(c) == 127 for c in pane['cwd'])) for tab in data['tabs'] for pane in tab['panes']):
                 warnings.append('Some working directories were unavailable or unsafe and were not used')
             return AdapterResult(Status.PARTIAL, warnings=warnings)
@@ -309,8 +311,17 @@ class KittyAdapter:
             tabs.append(item)
         return {'version': 1, 'tabs': tabs, 'active_tab': active_tab} if tabs else None
 
-    def session(self, data: dict[str, Any]) -> str:
+    def session(self, data: dict[str, Any], *, archive_refs: dict[tuple[int, int], tuple[int, int, int, int]] | None = None) -> str:
         if not self.validate(data): raise KittyError('Invalid Kitty state')
+        if archive_refs:
+            script = Path(__file__).resolve().parents[1] / 'archive_bootstrap.py'
+            executable = Path(sys.executable)
+            if not script.is_file() or not executable.is_absolute() or not os.access(executable, os.X_OK): raise KittyError('Phoenix archive viewer is unavailable')
+            for key, ref in archive_refs.items():
+                if not isinstance(key, tuple) or len(key) != 2 or not isinstance(ref, tuple) or len(ref) != 4 or any(type(n) is not int or n < 0 for n in (*key, *ref)) or ref[0] == 0:
+                    raise KittyError('Invalid archive coordinates')
+                if key[0] >= len(data['tabs']) or key[1] >= len(data['tabs'][key[0]]['panes']):
+                    raise KittyError('Archive coordinates do not match a Kitty pane')
         lines = []
         for ti, tab in enumerate(data['tabs']):
             lines += [f'new_tab Terminal {ti + 1}', 'layout ' + tab['layout']]
@@ -327,7 +338,13 @@ class KittyAdapter:
                 # Session files expand $ variables; skip paths with special expansion or controls.
                 if isinstance(cwd, str) and '$' not in cwd and all(ord(c) >= 32 and ord(c) != 127 for c in cwd) and Path(cwd).is_dir():
                     options.append('--cwd=' + shlex.quote(cwd))
-                lines.append('launch' + (' ' + ' '.join(options) if options else ''))
+                ref = archive_refs.get((ti, pi)) if archive_refs else None
+                if ref:
+                    options.append('--hold')
+                    command = ' ' + shlex.quote(str(executable)) + ' ' + shlex.quote(str(script)) + ' ' + ' '.join(str(x) for x in ref)
+                else:
+                    command = ''
+                lines.append('launch' + (' ' + ' '.join(options) if options else '') + command)
                 if 'topology' not in tab and pi == tab['active_pane']: lines.append('focus')
             if 'topology' in tab:
                 lines.append(f"focus_matching_window var:phoenix_pane=^{ti}_{tab['active_pane']}$")

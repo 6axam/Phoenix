@@ -16,6 +16,20 @@ def same_class(window: dict[str, Any], client: dict[str, Any]) -> bool:
     return bool(wanted & actual)
 
 
+def selected_archive_refs(snapshot: int, window: int, data: dict[str, Any], selected: set[tuple[int, int]] | None, stored: set[tuple[int, int, int]]) -> dict[tuple[int, int], tuple[int, int, int, int]]:
+    """Map selected pane positions back to original archive coordinates."""
+    refs: dict[tuple[int, int], tuple[int, int, int, int]] = {}
+    new_tab = 0
+    for ti, tab in enumerate(data['tabs']):
+        included = [pi for pi in range(len(tab['panes'])) if selected is None or (ti, pi) in selected]
+        if not included: continue
+        for new_pane, pi in enumerate(included):
+            if (window, ti, pi) in stored:
+                refs[new_tab, new_pane] = (snapshot, window, ti, pi)
+        new_tab += 1
+    return refs
+
+
 def geometry(window: dict[str, Any], old_monitors: list[dict[str, Any]], new_monitors: list[dict[str, Any]]) -> tuple[int, int, int, int] | None:
     try:
         old = next(m for m in old_monitors if m['name'] == window['monitor'])
@@ -106,14 +120,23 @@ class RecoveryExecutor:
     def __init__(self, backend: HyprlandBackend, registry: DesktopRegistry, manager: SnapshotManager, timeout: float = 8):
         self.backend, self.registry, self.manager, self.timeout = backend, registry, manager, timeout
 
-    def restore(self, snapshot_id: int, state: dict[str, Any], dry_run: bool = False, selected: set[int] | None = None, components: dict[int, set[tuple[int, int]]] | None = None) -> list[dict[str, Any]]:
+    def restore(self, snapshot_id: int, state: dict[str, Any], dry_run: bool = False, selected: set[int] | None = None, components: dict[int, set[tuple[int, int]]] | None = None, restore_history: bool = False) -> list[dict[str, Any]]:
         if dry_run:
-            return RecoveryPlanner(self.registry, self.manager).plan(state, self.backend.query('clients'), snapshot_id, selected, components)
+            plan = RecoveryPlanner(self.registry, self.manager).plan(state, self.backend.query('clients'), snapshot_id, selected, components)
+            if restore_history:
+                for item in plan:
+                    for step in item['steps']:
+                        if step['id'].startswith('archive:') and step['status'] == 'available':
+                            _, ti, pi = step['id'].split(':')
+                            chosen = components is None or item['index'] not in components or (int(ti), int(pi)) in components[item['index']]
+                            if item['action'] == 'launch' and chosen:
+                                step['detail'] = 'Historical text will be shown in this new Kitty pane'
+            return plan
         # A single restore process can mutate windows at a time; process death releases the lock.
         with lock(self.manager.path.with_suffix('.restore.lock'), blocking=False):
-            return self._restore(snapshot_id, state, selected, components)
+            return self._restore(snapshot_id, state, selected, components, restore_history)
 
-    def _restore(self, snapshot_id: int, state: dict[str, Any], selected: set[int] | None, components: dict[int, set[tuple[int, int]]] | None = None) -> list[dict[str, Any]]:
+    def _restore(self, snapshot_id: int, state: dict[str, Any], selected: set[int] | None, components: dict[int, set[tuple[int, int]]] | None = None, restore_history: bool = False) -> list[dict[str, Any]]:
         transaction = str(uuid.uuid4())
         results: list[dict[str, Any]] = []
         # Any previous ambiguous launch must not be repeated automatically.
@@ -121,6 +144,7 @@ class RecoveryExecutor:
             row = db.execute('SELECT result FROM runs WHERE snapshot_id=?', (snapshot_id,)).fetchone()
         import json
         previous = json.loads(row['result']) if row else []
+        stored_archives = {(a['window_index'], a['tab_index'], a['pane_index']) for a in self.manager.archives(snapshot_id)} if restore_history else set()
         uncertain = {r['index'] for r in previous if r.get('status') in ('launching', 'timeout', 'uncertain')}
         def durable_results() -> list[dict[str, Any]]:
             completed_indices = {item['index'] for item in results}
@@ -179,8 +203,12 @@ class RecoveryExecutor:
                                 launched = self.registry.launch_kitty_session(entry, session)
                                 if type(launched) is int and launched > 1: launched_pid = launched
                                 return bool(launched)
-                            adapted = kitty.execute(adapter_data, launch_session)
+                            original = window['adapters']['kitty']
+                            chosen = components.get(index) if components is not None and index in components else None
+                            refs = selected_archive_refs(snapshot_id, index, original, chosen, stored_archives) if restore_history else {}
+                            adapted = kitty.execute(adapter_data, launch_session, archive_refs=refs)
                             used_session = adapted.status.value == 'partial'
+                            if used_session and refs: result['terminal_history_requested'] = len(refs)
                             result['adapter_status'] = adapted.status.value
                             result['adapter_warnings'] = adapted.warnings
                             if used_session: result['kitty_structure'] = 'recreated_best_effort'

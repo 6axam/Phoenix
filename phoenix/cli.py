@@ -25,7 +25,7 @@ def parser() -> argparse.ArgumentParser:
     snap = sub.add_parser('snapshot', help='Создать ручной снимок'); snap.add_argument('--name')
     sub.add_parser('history', help='История снимков')
     inspect = sub.add_parser('inspect', help='Проверить и показать снимок'); inspect.add_argument('snapshot', nargs='?', default='latest')
-    restore = sub.add_parser('restore', help='Восстановить или показать план'); restore.add_argument('snapshot', nargs='?', default='latest'); restore.add_argument('--safe', action='store_true', help='Только безопасные действия (режим по умолчанию)'); restore.add_argument('--dry-run', action='store_true')
+    restore = sub.add_parser('restore', help='Восстановить или показать план'); restore.add_argument('snapshot', nargs='?', default='latest'); restore.add_argument('--safe', action='store_true', help='Только безопасные действия (режим по умолчанию)'); restore.add_argument('--dry-run', action='store_true'); restore.add_argument('--terminal-history', action='store_true', help='Показать сохранённый вывод в новых панелях Kitty')
     sub.add_parser('doctor', help='Диагностика окружения')
     gui = sub.add_parser('gui', help='Открыть интерфейс'); gui.add_argument('--prompt', action='store_true', help=argparse.SUPPRESS)
     sub.add_parser('daemon', help='Запустить периодические снимки и запрос при входе')
@@ -44,6 +44,8 @@ def parser() -> argparse.ArgumentParser:
     resume_codex.add_argument('session_id', help='Полный UUID разговора'); resume_codex.add_argument('--cwd', required=True, help='Абсолютный путь к проекту')
     saved_codex = sub.add_parser('codex-restore', help='Продолжить Codex из сохранённой панели в текущем Kitty')
     saved_codex.add_argument('snapshot'); saved_codex.add_argument('window', type=int); saved_codex.add_argument('tab', type=int); saved_codex.add_argument('pane', type=int)
+    replay = sub.add_parser('archive-replay', help=argparse.SUPPRESS)
+    replay.add_argument('snapshot', type=int); replay.add_argument('window', type=int); replay.add_argument('tab', type=int); replay.add_argument('pane', type=int)
     inspect_tmux = sub.add_parser('tmux-inspect', help='Проверить структуру отдельного tmux через приватный сокет')
     inspect_tmux.add_argument('--socket', required=True, help='Абсолютный путь к сокету tmux')
     return p
@@ -102,6 +104,9 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s %(message)s')
     args = parser().parse_args(argv)
     try:
+        if args.command == 'archive-replay':
+            from .archive_replay import replay
+            replay(SnapshotManager(readonly=True), args.snapshot, args.window, args.tab, args.pane); return 0
         if args.command == 'codex-check':
             from .adapters.codex_session import check_session
             dump(check_session(args.session_id, args.cwd)); return 0
@@ -139,7 +144,7 @@ def main(argv: list[str] | None = None) -> int:
             row, state = manager.get(args.snapshot); dump({'id': row['id'], 'state': state})
         elif args.command == 'restore':
             row, state = manager.get(args.snapshot)
-            result = RecoveryExecutor(backend, DesktopRegistry(), manager).restore(row['id'], state, args.dry_run)
+            result = RecoveryExecutor(backend, DesktopRegistry(), manager).restore(row['id'], state, args.dry_run, restore_history=args.terminal_history)
             dump(result)
             if not args.dry_run:
                 decide('restore')

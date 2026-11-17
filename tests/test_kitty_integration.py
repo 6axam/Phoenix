@@ -164,3 +164,65 @@ def test_real_resized_splits_preserve_neighbors_not_exact_proportions(kitty_fact
         return {w['cwd']: {d: sorted(names[n] for n in w.get('neighbors', {}).get(d, [])) for d in ('left', 'right', 'top', 'bottom')} for w in tab['windows']}
     assert edges(get_tab(path)) == edges(get_tab(target))
     assert 'sizes may differ' in next(s.detail for s in adapter.plan(result.data) if s.id == 'tab:0')
+
+
+def test_real_historical_output_appears_in_new_kitty_panel(kitty_factory, tmp_path):
+    from phoenix.core import SnapshotManager
+    project = tmp_path / 'project'; project.mkdir()
+    marker = tmp_path / 'must-not-exist'
+    pane = {'cwd': str(project), 'process': 'unknown', 'scrollback_capture': 'captured'}
+    data = {'version': 1, 'active_tab': 0, 'tabs': [{'layout': 'vertical', 'active_pane': 0, 'panes': [pane]}]}
+    state = {'windows': [{'class': 'kitty', 'adapters': {'kitty': data}}]}
+    manager = SnapshotManager()
+    text = f'PHOENIX-HISTORY-MARKER\ntouch {marker}\n'.encode() + b'\x1b]52;c;secret\x07'
+    snapshot = manager.save(state, archives=[{'window': 0, 'tab': 0, 'pane': 0, 'data': text}])
+    adapter = KittyAdapter({})
+    session = adapter.session(data, archive_refs={(0, 0): (snapshot, 0, 0, 0)})
+    process, socket = kitty_factory('history-restored', session)
+    deadline = time.monotonic() + 8; output = ''
+    while time.monotonic() < deadline:
+        output = subprocess.run(['kitten', '@', '--to', 'unix:' + socket, 'get-text', '--extent', 'all'], capture_output=True, text=True, check=True, timeout=5).stdout
+        if 'PHOENIX-HISTORY-MARKER' in output and 'НОВАЯ ОБОЛОЧКА' in output: break
+        time.sleep(.1)
+    assert 'PHOENIX-HISTORY-MARKER' in output and 'НОВАЯ ОБОЛОЧКА' in output
+    assert 'secret' not in output and not marker.exists()
+    assert process.poll() is None
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        window = get_tab(socket)['windows'][0]
+        if window['cwd'] == str(project) and any(os.path.basename(p.get('cmdline', [''])[0]) in ('bash', 'sh') for p in window.get('foreground_processes', []) if p.get('cmdline')):
+            break
+        time.sleep(.1)
+    else: pytest.fail('New shell did not start in the saved directory after showing history')
+
+
+def test_real_archives_remain_attached_to_their_own_selected_panes(kitty_factory, tmp_path):
+    from phoenix.core import SnapshotManager
+    from phoenix.recovery import selected_archive_refs
+    dirs = [tmp_path / str(i) for i in range(3)]
+    for directory in dirs: directory.mkdir()
+    panes = [{'cwd': str(d), 'process': 'unknown', 'scrollback_capture': 'captured'} for d in dirs]
+    data = {'version': 1, 'active_tab': 0, 'tabs': [{'layout': 'horizontal', 'active_pane': 1, 'panes': panes}]}
+    state = {'windows': [{'class': 'kitty', 'adapters': {'kitty': data}}]}
+    manager = SnapshotManager()
+    records = [{'window': 0, 'tab': 0, 'pane': i, 'data': f'UNIQUE-HISTORY-{i}\n'.encode()} for i in range(3)]
+    sid = manager.save(state, archives=records)
+    adapter = KittyAdapter({})
+    chosen = {(0, 1), (0, 2)}
+    selected = adapter.select(data, chosen)
+    refs = selected_archive_refs(sid, 0, data, chosen, {(0, 0, i) for i in range(3)})
+    _, socket = kitty_factory('selected-history', adapter.session(selected, archive_refs=refs))
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline:
+        windows = get_tab(socket)['windows']
+        if len(windows) == 2:
+            results = {}
+            for window in windows:
+                result = subprocess.run(['kitten', '@', '--to', 'unix:' + socket, 'get-text', '--match', f"id:{window['id']}", '--extent', 'all'], capture_output=True, text=True, check=True, timeout=5)
+                results[window['cwd']] = result.stdout
+            if all(f'UNIQUE-HISTORY-{i}' in results.get(str(dirs[i]), '') for i in (1, 2)): break
+        time.sleep(.1)
+    else: pytest.fail('Selected panes did not receive their matching archived text')
+    assert 'UNIQUE-HISTORY-2' not in results[str(dirs[1])]
+    assert 'UNIQUE-HISTORY-1' not in results[str(dirs[2])]
+    assert all('UNIQUE-HISTORY-0' not in value for value in results.values())
