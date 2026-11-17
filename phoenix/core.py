@@ -412,31 +412,38 @@ class SnapshotManager:
             return [dict(r) for r in db.execute('SELECT r.window_index,r.tab_index,r.pane_index,SUM(c.raw_size) AS bytes,COUNT(*) AS chunks FROM archive_refs r JOIN archive_chunks c ON c.digest=r.digest WHERE r.snapshot_id=? GROUP BY r.window_index,r.tab_index,r.pane_index ORDER BY r.window_index,r.tab_index,r.pane_index', (snapshot_id,))]
 
     def archive_text(self, snapshot_id: int, window: int, tab: int, pane: int, limit: int = 128 * 1024**2) -> bytes:
+        return b''.join(self.iter_archive_chunks(snapshot_id, window, tab, pane, limit))
+
+    def iter_archive_chunks(self, snapshot_id: int, window: int, tab: int, pane: int, limit: int = 128 * 1024**2):
+        """Read one consistent archive, validating every block and the whole manifest.
+
+        Callers must consume the iterator completely before trusting any result.
+        """
         if self.db_version < 5: raise LookupError('Terminal archive not found')
         with self.connect() as db:
+            db.execute('BEGIN')
             manifest = db.execute('SELECT parts,raw_size,digest FROM archive_manifests WHERE snapshot_id=? AND window_index=? AND tab_index=? AND pane_index=?', (snapshot_id, window, tab, pane)).fetchone()
             rows = db.execute('SELECT r.part,c.digest,c.raw_size,length(c.data) AS stored_size FROM archive_refs r JOIN archive_chunks c ON c.digest=r.digest WHERE r.snapshot_id=? AND r.window_index=? AND r.tab_index=? AND r.pane_index=? ORDER BY r.part', (snapshot_id, window, tab, pane)).fetchall()
-        if not manifest: raise LookupError('Terminal archive not found')
-        if manifest['parts'] > (limit // 262144 + 1) or len(rows) != manifest['parts'] or manifest['raw_size'] < 0 or manifest['raw_size'] > limit: raise ValueError('Terminal archive is incomplete or oversized')
-        output = bytearray()
-        for number, row in enumerate(rows):
-            size = row['raw_size']
-            if row['part'] != number or not 0 <= size <= 262144 or not 0 <= row['stored_size'] <= 263000 or len(output) + size > limit:
-                raise ValueError('Invalid or oversized terminal archive')
-            try:
-                with self.connect() as db:
+            if not manifest: raise LookupError('Terminal archive not found')
+            if manifest['parts'] > (limit // 262144 + 1) or len(rows) != manifest['parts'] or manifest['raw_size'] < 0 or manifest['raw_size'] > limit: raise ValueError('Terminal archive is incomplete or oversized')
+            total = 0; whole = hashlib.sha256()
+            for number, row in enumerate(rows):
+                size = row['raw_size']
+                if row['part'] != number or not 0 <= size <= 262144 or not 0 <= row['stored_size'] <= 263000 or total + size > limit:
+                    raise ValueError('Invalid or oversized terminal archive')
+                try:
                     chunk = db.execute('SELECT data FROM archive_chunks WHERE digest=?', (row['digest'],)).fetchone()
-                if not chunk or len(chunk['data']) != row['stored_size']: raise ValueError('Terminal archive is incomplete')
-                decoder = zlib.decompressobj()
-                raw = decoder.decompress(chunk['data'], size + 1)
-                if not decoder.eof or decoder.unused_data or len(raw) != size or hashlib.sha256(raw).hexdigest() != row['digest']:
-                    raise ValueError('Terminal archive integrity check failed')
-            except zlib.error as exc:
-                raise ValueError('Terminal archive is corrupt') from exc
-            output.extend(raw)
-        if len(output) != manifest['raw_size'] or hashlib.sha256(output).hexdigest() != manifest['digest']:
-            raise ValueError('Terminal archive integrity check failed')
-        return bytes(output)
+                    if not chunk or len(chunk['data']) != row['stored_size']: raise ValueError('Terminal archive is incomplete')
+                    decoder = zlib.decompressobj()
+                    raw = decoder.decompress(chunk['data'], size + 1)
+                    if not decoder.eof or decoder.unused_data or len(raw) != size or hashlib.sha256(raw).hexdigest() != row['digest']:
+                        raise ValueError('Terminal archive integrity check failed')
+                except zlib.error as exc:
+                    raise ValueError('Terminal archive is corrupt') from exc
+                total += len(raw); whole.update(raw)
+                yield raw
+            if total != manifest['raw_size'] or whole.hexdigest() != manifest['digest']:
+                raise ValueError('Terminal archive integrity check failed')
 
     def purge_archives(self) -> None:
         with lock(self.path.with_suffix('.lock')), self.connect() as db:

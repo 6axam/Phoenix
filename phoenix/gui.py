@@ -271,47 +271,86 @@ def run(manager: SnapshotManager, backend: HyprlandBackend, prompt: bool = False
             selector = Gtk.DropDown.new_from_strings([f"Окно {e['window_index'] + 1}, вкладка {e['tab_index'] + 1}, панель {e['pane_index'] + 1} — {e['bytes']} байт" for e in entries]); box.append(selector)
             box.append(Gtk.Label(label='Исторический текст; это не работающий процесс.', xalign=0))
             metadata = Gtk.Label(xalign=0, wrap=True); box.append(metadata)
-            search = Gtk.SearchEntry(placeholder_text='Поиск в показанном тексте'); box.append(search)
-            search_status = Gtk.Label(xalign=0); box.append(search_status)
+            search = Gtk.SearchEntry(placeholder_text='Поиск по всему архиву'); box.append(search)
+            controls = Gtk.Box(spacing=8); box.append(controls)
+            find_button = Gtk.Button(label='Найти'); next_button = Gtk.Button(label='Далее')
+            controls.append(find_button); controls.append(next_button)
+            search_status = Gtk.Label(xalign=0, wrap=True); box.append(search_status)
             scroll = Gtk.ScrolledWindow(vexpand=True); box.append(scroll)
             textview = Gtk.TextView(editable=False, monospace=True); scroll.set_child(textview)
-            generation = [0]
-            def find_text(*_args: Any) -> None:
-                buffer = textview.get_buffer(); needle = search.get_text()
-                if not needle:
-                    search_status.set_text(''); return
-                found = buffer.get_start_iter().forward_search(needle, Gtk.TextSearchFlags.TEXT_ONLY, None)
-                if found is None:
-                    search_status.set_text('Не найдено в показанной части архива'); return
-                start, end = found
-                buffer.select_range(start, end); textview.scroll_to_iter(start, 0.1, False, 0, 0)
-                search_status.set_text('Первое совпадение в показанной части архива')
-            search.connect('search-changed', find_text)
-            def show(*_args: Any) -> None:
+            from concurrent.futures import ThreadPoolExecutor
+            from .archive_view import preview as archive_preview, search_archive
+            pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='phoenix-archive')
+            generation = [0]; pending = [None]; last_match = [None]; closed = [False]
+
+            def submit(needle: str | None = None, start: int = 0) -> None:
                 index = selector.get_selected()
                 if index >= len(entries): return
                 entry = entries[index]; generation[0] += 1; token = generation[0]
+                if pending[0] is not None: pending[0].cancel()
+                search_status.set_text('Поиск и проверка архива…' if needle else 'Чтение и проверка архива…')
+                def worker() -> Any:
+                    if generation[0] != token or closed[0]: return None
+                    chunks = manager.iter_archive_chunks(row['id'], entry['window_index'], entry['tab_index'], entry['pane_index'])
+                    def cancellable() -> Any:
+                        from concurrent.futures import CancelledError
+                        try:
+                            for chunk in chunks:
+                                if generation[0] != token or closed[0]: raise CancelledError()
+                                yield chunk
+                        finally:
+                            chunks.close()
+                    return search_archive(cancellable(), needle, start) if needle is not None else archive_preview(cancellable())
+                def finished(future: Any) -> None:
+                    if future.cancelled(): return
+                    try: result, error = future.result(), None
+                    except Exception as exc: result, error = None, str(exc)
+                    def publish() -> bool:
+                        if closed[0] or generation[0] != token: return False
+                        if error:
+                            textview.get_buffer().set_text(''); search_status.set_text('Ошибка чтения архива: ' + error); return False
+                        if result is None: return False
+                        if needle is None:
+                            textview.get_buffer().set_text(result.text)
+                            search_status.set_text('Показано начало архива; поиск охватывает весь архив.' if result.total > len(result.text) else 'Показан весь архив.')
+                        elif result.match is None:
+                            last_match[0] = None; search_status.set_text('Совпадений больше нет.'); return False
+                        else:
+                            last_match[0] = (needle, result.match)
+                            buffer = textview.get_buffer(); buffer.set_text(result.text)
+                            begin = buffer.get_iter_at_offset(result.selection)
+                            end = buffer.get_iter_at_offset(result.selection + len(needle))
+                            buffer.select_range(begin, end); textview.scroll_to_iter(begin, 0.1, False, 0, 0)
+                            search_status.set_text('Совпадение в архиве; показан окружающий текст.')
+                        return False
+                    GLib.idle_add(publish)
+                pending[0] = pool.submit(worker); pending[0].add_done_callback(finished)
+
+            def find_text(_button: Any, following: bool = False) -> None:
+                needle = search.get_text()
+                if not needle:
+                    search_status.set_text('Введите текст для поиска.'); return
+                start = last_match[0][1] + 1 if following and last_match[0] and last_match[0][0] == needle else 0
+                submit(needle, start)
+            find_button.connect('clicked', lambda button: find_text(button))
+            next_button.connect('clicked', lambda button: find_text(button, True))
+            search.connect('activate', lambda entry: find_text(entry))
+            def show(*_args: Any) -> None:
+                index = selector.get_selected()
+                if index >= len(entries): return
+                entry = entries[index]; last_match[0] = None
                 try:
                     pane = state['windows'][entry['window_index']]['adapters']['kitty']['tabs'][entry['tab_index']]['panes'][entry['pane_index']]
                     truncated = pane.get('scrollback_capture') == 'truncated'
                 except (KeyError, IndexError, TypeError):
                     truncated = False
                 metadata.set_text('Снимок от ' + datetime.fromtimestamp(row['created']).strftime('%d.%m.%Y %H:%M:%S') + (' · архив усечён при сохранении' if truncated else ' · отметка усечения отсутствует'))
-                search_status.set_text(''); search.set_text('')
-                textview.get_buffer().set_text('Загрузка…')
-                def worker() -> None:
-                    try:
-                        from .text import safe_text
-                        raw = manager.archive_text(row['id'], entry['window_index'], entry['tab_index'], entry['pane_index'])
-                        text = safe_text(raw[:256 * 1024])
-                        if len(raw) > 256 * 1024: text += '\n[Показаны первые 256 КиБ; полный архив доступен через CLI.]'
-                    except Exception as exc: text = 'Ошибка чтения архива: ' + str(exc)
-                    def done() -> bool:
-                        if generation[0] == token: textview.get_buffer().set_text(text)
-                        return False
-                    GLib.idle_add(done)
-                threading.Thread(target=worker, daemon=True).start()
-            selector.connect('notify::selected', show); dialog.connect('response', lambda d, _r: d.destroy()); show(); dialog.present()
+                search.set_text(''); textview.get_buffer().set_text(''); submit()
+            def close(box_dialog: Any, _response: Any) -> None:
+                closed[0] = True; generation[0] += 1
+                if pending[0] is not None: pending[0].cancel()
+                pool.shutdown(wait=False, cancel_futures=True); box_dialog.destroy()
+            selector.connect('notify::selected', show); dialog.connect('response', close); show(); dialog.present()
         preview.connect('clicked', show_preview); snapshot.connect('clicked', take_snapshot); restore.connect('clicked', do_restore); skip.connect('clicked', do_skip); settings.connect('clicked', show_settings); pin.connect('clicked', toggle_pin); delete.connect('clicked', remove_snapshot); terminal_archive.connect('clicked', show_archive)
         window.present()
     app.connect('activate', activate)
