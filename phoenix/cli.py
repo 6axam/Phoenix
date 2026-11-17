@@ -38,6 +38,8 @@ def parser() -> argparse.ArgumentParser:
     archive_show = archive_sub.add_parser('show'); archive_show.add_argument('snapshot'); archive_show.add_argument('window', type=int); archive_show.add_argument('tab', type=int); archive_show.add_argument('pane', type=int)
     archive_purge = archive_sub.add_parser('purge'); archive_purge.add_argument('--confirm', action='store_true', required=True, help='Удалить все архивы из текущей базы')
     trust = sub.add_parser('trust-desktop', help='Доверять конкретному desktop-файлу до его изменения'); trust.add_argument('path', help='Абсолютный путь к desktop-файлу')
+    codex = sub.add_parser('codex-check', help='Проверить конкретный разговор Codex и каталог проекта')
+    codex.add_argument('session_id', help='Полный UUID разговора'); codex.add_argument('--cwd', required=True, help='Абсолютный путь к проекту')
     return p
 
 
@@ -94,6 +96,9 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s %(message)s')
     args = parser().parse_args(argv)
     try:
+        if args.command == 'codex-check':
+            from .adapters.codex_session import check_session
+            dump(check_session(args.session_id, args.cwd)); return 0
         if args.command == 'config':
             dump({'path': str(xdg_path('CONFIG') / 'config.json'), 'settings': config()}); return 0
         readonly = args.command in ('status', 'history', 'inspect', 'doctor', 'recovery-log') or (args.command == 'restore' and args.dry_run) or (args.command == 'archive' and args.archive_command in ('list', 'show'))
