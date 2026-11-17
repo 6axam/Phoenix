@@ -83,6 +83,9 @@ def run(manager: SnapshotManager, backend: HyprlandBackend, prompt: bool = False
                                 child = Gtk.CheckButton(label=label); child.set_margin_start(26); child.set_active(True)
                                 checks.append(child); pane_checks[wi][(ti,pi)] = child
                 details.set_label(f'Приложения в снимке: {len(checkboxes)}')
+                tmux = state.get('tmux')
+                if isinstance(tmux, dict) and isinstance(tmux.get('sessions'), list):
+                    checks.append(Gtk.Label(label=f"Сохранено сеансов tmux: {len(tmux['sessions'])} · привязка к панелям и восстановление пока недоступны", xalign=0, wrap=True))
                 pin.set_label('Открепить' if row['pinned'] else 'Закрепить')
                 output.set_text(f"Выбран снимок #{row['id']}. Листайте рабочие столы этого снимка.")
             except Exception as exc: output.set_text(str(exc))
@@ -234,6 +237,8 @@ def run(manager: SnapshotManager, backend: HyprlandBackend, prompt: bool = False
             sockets_scroll = Gtk.ScrolledWindow(); sockets_scroll.set_min_content_height(64); sockets_scroll.set_max_content_height(100); sockets_scroll.set_child(sockets_view); box.append(sockets_scroll)
             scrollback = Gtk.CheckButton(label='Архивировать текст терминала (может содержать пароли и токены)'); scrollback.set_active(bool(cfg.get('kitty_scrollback', False))); box.append(scrollback)
             codex_bindings = Gtk.CheckButton(label='Сохранять явные привязки Codex к панелям Kitty'); codex_bindings.set_active(bool(cfg.get('kitty_codex_bindings', False))); box.append(codex_bindings)
+            tmux_enabled = Gtk.CheckButton(label='Сохранять структуру сессий tmux с указанного сокета'); tmux_enabled.set_active(bool(cfg.get('tmux_metadata_enabled', False))); box.append(tmux_enabled)
+            tmux_socket = Gtk.Entry(); tmux_socket.set_placeholder_text('Абсолютный путь к приватному сокету tmux'); tmux_socket.set_text(str(cfg.get('tmux_socket', ''))); box.append(tmux_socket)
             box.append(Gtk.Label(label='Лимит на панель, МиБ', xalign=0))
             pane_limit = Gtk.SpinButton.new_with_range(1, 128, 1); pane_limit.set_value(int(cfg.get('kitty_scrollback_limit', 32*1024**2))/1024**2); box.append(pane_limit)
             box.append(Gtk.Label(label='Общий лимит архива, МиБ', xalign=0))
@@ -258,7 +263,7 @@ def run(manager: SnapshotManager, backend: HyprlandBackend, prompt: bool = False
             def response(box_dialog: Any, answer: int) -> None:
                 if answer == Gtk.ResponseType.ACCEPT:
                     try:
-                        update_config({'capture_previews': capture.get_active(), 'snapshot_retention': retention.get_value_as_int(), 'interval_seconds': interval.get_value_as_int(), 'kitty_enabled': kitty_enabled.get_active(), 'kitty_scrollback': scrollback.get_active(), 'kitty_codex_bindings': codex_bindings.get_active(), 'kitty_socket': kitty_socket.get_text(), 'kitty_sockets': [x.strip() for x in sockets_view.get_buffer().get_text(sockets_view.get_buffer().get_start_iter(), sockets_view.get_buffer().get_end_iter(), True).splitlines() if x.strip()], 'kitty_scrollback_limit': pane_limit.get_value_as_int() * 1024**2, 'kitty_archive_total_limit': total_limit.get_value_as_int() * 1024**2})
+                        update_config({'capture_previews': capture.get_active(), 'snapshot_retention': retention.get_value_as_int(), 'interval_seconds': interval.get_value_as_int(), 'kitty_enabled': kitty_enabled.get_active(), 'kitty_scrollback': scrollback.get_active(), 'kitty_codex_bindings': codex_bindings.get_active(), 'tmux_metadata_enabled': tmux_enabled.get_active(), 'tmux_socket': tmux_socket.get_text(), 'kitty_socket': kitty_socket.get_text(), 'kitty_sockets': [x.strip() for x in sockets_view.get_buffer().get_text(sockets_view.get_buffer().get_start_iter(), sockets_view.get_buffer().get_end_iter(), True).splitlines() if x.strip()], 'kitty_scrollback_limit': pane_limit.get_value_as_int() * 1024**2, 'kitty_archive_total_limit': total_limit.get_value_as_int() * 1024**2})
                         output.set_text('Настройки сохранены. Ранее сохранённые изображения остаются в истории и резервных копиях.')
                     except Exception as exc: output.set_text('Ошибка: ' + str(exc))
                 box_dialog.destroy()

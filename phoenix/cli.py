@@ -44,6 +44,8 @@ def parser() -> argparse.ArgumentParser:
     resume_codex.add_argument('session_id', help='Полный UUID разговора'); resume_codex.add_argument('--cwd', required=True, help='Абсолютный путь к проекту')
     saved_codex = sub.add_parser('codex-restore', help='Продолжить Codex из сохранённой панели в текущем Kitty')
     saved_codex.add_argument('snapshot'); saved_codex.add_argument('window', type=int); saved_codex.add_argument('tab', type=int); saved_codex.add_argument('pane', type=int)
+    inspect_tmux = sub.add_parser('tmux-inspect', help='Проверить структуру отдельного tmux через приватный сокет')
+    inspect_tmux.add_argument('--socket', required=True, help='Абсолютный путь к сокету tmux')
     return p
 
 
@@ -112,6 +114,9 @@ def main(argv: list[str] | None = None) -> int:
             _, state = manager.get(args.snapshot)
             ident, cwd = saved_binding(state, args.window, args.tab, args.pane)
             return resume_in_current_pane(ident, cwd)
+        if args.command == 'tmux-inspect':
+            from .adapters.tmux_session import collect_tmux
+            dump(collect_tmux(args.socket)); return 0
         if args.command == 'config':
             dump({'path': str(xdg_path('CONFIG') / 'config.json'), 'settings': config()}); return 0
         readonly = args.command in ('status', 'history', 'inspect', 'doctor', 'recovery-log') or (args.command == 'restore' and args.dry_run) or (args.command == 'archive' and args.archive_command in ('list', 'show'))

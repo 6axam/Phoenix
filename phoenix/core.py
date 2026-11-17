@@ -515,12 +515,13 @@ def config() -> dict[str, Any]:
 
 
 def update_config(changes: dict[str, Any]) -> None:
-    allowed = {'capture_previews', 'snapshot_retention', 'interval_seconds', 'kitty_enabled', 'kitty_scrollback', 'kitty_codex_bindings', 'kitty_socket', 'kitty_sockets', 'kitty_scrollback_limit', 'kitty_archive_total_limit', 'kitty_exclude_panels', 'kitty_exclude_text'}
+    allowed = {'capture_previews', 'snapshot_retention', 'interval_seconds', 'kitty_enabled', 'kitty_scrollback', 'kitty_codex_bindings', 'kitty_socket', 'kitty_sockets', 'kitty_scrollback_limit', 'kitty_archive_total_limit', 'kitty_exclude_panels', 'kitty_exclude_text', 'tmux_metadata_enabled', 'tmux_socket'}
     if set(changes) - allowed:
         raise ValueError('Unknown setting')
-    for key in ('capture_previews', 'kitty_enabled', 'kitty_scrollback', 'kitty_codex_bindings'):
+    for key in ('capture_previews', 'kitty_enabled', 'kitty_scrollback', 'kitty_codex_bindings', 'tmux_metadata_enabled'):
         if key in changes and not isinstance(changes[key], bool): raise ValueError('Invalid ' + key)
     if 'kitty_socket' in changes and (not isinstance(changes['kitty_socket'], str) or len(changes['kitty_socket']) > 4096): raise ValueError('Invalid socket')
+    if 'tmux_socket' in changes and (not isinstance(changes['tmux_socket'], str) or len(changes['tmux_socket']) > 4096 or (changes['tmux_socket'] and not changes['tmux_socket'].startswith('/'))): raise ValueError('Invalid tmux socket')
     if 'kitty_sockets' in changes and (not isinstance(changes['kitty_sockets'], list) or len(changes['kitty_sockets']) > 16 or any(not isinstance(p, str) or not p.startswith('/') or len(p) > 4096 for p in changes['kitty_sockets'])): raise ValueError('Invalid kitty_sockets')
     for key in ('kitty_exclude_panels', 'kitty_exclude_text'):
         if key in changes and (not isinstance(changes[key], list) or len(changes[key]) > 100): raise ValueError('Invalid ' + key)
@@ -684,7 +685,14 @@ class Collector:
         for window, captured in captured_windows:
             index = next(i for i, candidate in enumerate(windows) if candidate is window)
             self.archives.extend(dict(a, window=index) for a in captured)
-        return {'schema': SCHEMA, 'windows': windows, 'monitors': [{k: m.get(k) for k in ('name', 'x', 'y', 'width', 'height', 'scale', 'transform')} for m in sorted(monitors, key=lambda item: str(item.get('name', '')))], 'workspaces': [{'id': w.get('id'), 'name': w.get('name'), 'monitor': w.get('monitor')} for w in sorted(workspaces, key=lambda item: str(item.get('id', '')))]}
+        state = {'schema': SCHEMA, 'windows': windows, 'monitors': [{k: m.get(k) for k in ('name', 'x', 'y', 'width', 'height', 'scale', 'transform')} for m in sorted(monitors, key=lambda item: str(item.get('name', '')))], 'workspaces': [{'id': w.get('id'), 'name': w.get('name'), 'monitor': w.get('monitor')} for w in sorted(workspaces, key=lambda item: str(item.get('id', '')))]}
+        if self.settings.get('tmux_metadata_enabled', False):
+            from .adapters.tmux_session import TmuxError, collect_tmux
+            try:
+                state['tmux'] = collect_tmux(self.settings.get('tmux_socket', ''))
+            except (TmuxError, TypeError, ValueError) as exc:
+                self.adapter_warnings.append('tmux: ' + str(exc))
+        return state
 
 
 def desktop_fingerprint(path: Path) -> str:
